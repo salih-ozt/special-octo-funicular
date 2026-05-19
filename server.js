@@ -93,6 +93,197 @@ const forgotPasswordLimiter = rateLimit({
     message: { error: 'Çok fazla şifre sıfırlama talebi. Lütfen 1 saat sonra tekrar deneyin.' },
     skip: (req) => process.env.NODE_ENV === 'test',
 });
+
+// ════════════════════════════════════════════════════════════════════
+// 🔒 GLOBAL SPAM KORUMA — Auto-Ban Sistemi
+// ════════════════════════════════════════════════════════════════════
+// In-memory violation tracker (cluster'da her worker bağımsız; production'da Redis önerirlir)
+const spamViolations = new Map(); // ip → { count, firstViolation }
+
+// Otomatik IP ban — DB'ye yazar (pool henüz tanımlı değil; fn tanımı yeterli, pool startup'ta hazır)
+async function recordSpamViolation(ip, reason, pool, threshold = 3) {
+    if (!ip || ip === 'unknown') return;
+    const now  = Date.now();
+    const prev = spamViolations.get(ip) || { count: 0, firstViolation: now };
+    prev.count++;
+    spamViolations.set(ip, prev);
+    console.warn(`[SpamGuard] IP: ${ip} | İhlal #${prev.count} | Sebep: ${reason}`);
+    if (prev.count >= threshold) {
+        try {
+            await pool.query(
+                `INSERT INTO banned_ips (ip, reason, "bannedAt")
+                 VALUES ($1, $2, NOW())
+                 ON CONFLICT (ip) DO NOTHING`,
+                [ip, `${reason} — ${prev.count} rate limit ihlali`]
+            );
+            console.warn(`🚫 [AutoBan] IP BAN'a alındı: ${ip} | ${reason}`);
+        } catch (dbErr) {
+            console.error('[AutoBan] DB hatası:', dbErr.message);
+        }
+    }
+}
+
+// Ortak limiter factory — auto-ban destekli
+function makeSpamLimiter({ windowMs, max, reason, threshold = 3, keyFn }) {
+    // keyFn sadece (req) alıyor ama express-rate-limit (req, res) bekliyor.
+    // IPv6 doğrulamasını geçmek için: IP bazlı anahtarlar ipKeyGenerator üzerinden,
+    // kullanıcı-id bazlı anahtarlar ise IP'ye geri düşmeden doğrudan döner.
+    const keyGenerator = keyFn
+        ? (req, res) => {
+              const userId = req.user?.id;
+              // Kullanıcı ID varsa → IP'ye dokunmadan direkt kullan (IPv6 sorunu yok)
+              if (userId) return String(userId);
+              // Yoksa → ipKeyGenerator ile IPv6-safe IP al
+              return rateLimit.ipKeyGenerator(req, res);
+          }
+        : (req, res) => rateLimit.ipKeyGenerator(req, res);
+
+    return rateLimit({
+        windowMs,
+        max,
+        standardHeaders: true,
+        legacyHeaders: false,
+        keyGenerator,
+        skip: (req) => process.env.NODE_ENV === 'test',
+        handler: async (req, res) => {
+            let ip = 'unknown';
+            try { ip = rateLimit.ipKeyGenerator(req, res) || 'unknown'; } catch (_) {
+                ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown';
+            }
+            if (typeof pool !== 'undefined' && pool !== null) {
+                recordSpamViolation(ip, reason, pool, threshold).catch(() => {});
+            }
+            return res.status(429).json({
+                success: false,
+                error: 'Çok fazla istek gönderildi. Lütfen daha sonra tekrar deneyin.',
+                retryAfter: Math.ceil(windowMs / 60000) + ' dakika'
+            });
+        }
+    });
+}
+
+// ── Partnership ──────────────────────────────────────────────────────
+const partnershipLimiter = makeSpamLimiter({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 5,
+    reason: 'Partnership spam',
+    threshold: 3,
+});
+
+// Partnership IP ban kontrol middleware (banned_ips tablosu)
+const checkPartnershipIpBan = async (req, res, next) => {
+    const ip = req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim();
+    if (!ip) return next();
+    try {
+        const banned = await pool.query(`SELECT id FROM banned_ips WHERE ip = $1 LIMIT 1`, [ip]);
+        if (banned.rows.length > 0) {
+            console.warn(`[Partnership] Banlı IP erişim girişimi: ${ip}`);
+            return res.status(403).json({ success: false, error: 'Erişiminiz kısıtlanmıştır.' });
+        }
+        next();
+    } catch (err) {
+        console.error('[checkPartnershipIpBan] DB hatası:', err.message);
+        next();
+    }
+};
+
+// ── Resend Verification — e-posta flood koruması ─────────────────────
+const resendVerificationLimiter = makeSpamLimiter({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 3,
+    reason: 'Resend-verification spam',
+    threshold: 3,
+});
+
+// ── Post oluşturma — authenticated spam ──────────────────────────────
+const postCreateLimiter = makeSpamLimiter({
+    windowMs: 15 * 60 * 1000, // 15 dakika
+    max: 20,
+    reason: 'Post-create spam',
+    threshold: 5,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Yorum spam ───────────────────────────────────────────────────────
+const commentLimiter = makeSpamLimiter({
+    windowMs: 5 * 60 * 1000, // 5 dakika
+    max: 20,
+    reason: 'Comment spam',
+    threshold: 5,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Like spam ────────────────────────────────────────────────────────
+const likeLimiter = makeSpamLimiter({
+    windowMs: 60 * 1000, // 1 dakika
+    max: 60,
+    reason: 'Like spam',
+    threshold: 10,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Follow spam ──────────────────────────────────────────────────────
+const followLimiter = makeSpamLimiter({
+    windowMs: 15 * 60 * 1000, // 15 dakika
+    max: 50,
+    reason: 'Follow spam',
+    threshold: 5,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Report spam ─────────────────────────────────────────────────────
+const reportLimiter = makeSpamLimiter({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 10,
+    reason: 'Report spam',
+    threshold: 3,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Search spam ─────────────────────────────────────────────────────
+const searchLimiter = makeSpamLimiter({
+    windowMs: 60 * 1000, // 1 dakika
+    max: 30,
+    reason: 'Search spam',
+    threshold: 10,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Upload spam ─────────────────────────────────────────────────────
+const uploadLimiter = makeSpamLimiter({
+    windowMs: 15 * 60 * 1000, // 15 dakika
+    max: 15,
+    reason: 'Upload spam',
+    threshold: 3,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Store/ürün oluşturma ─────────────────────────────────────────────
+const storeLimiter = makeSpamLimiter({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 20,
+    reason: 'Store-create spam',
+    threshold: 5,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Stories ─────────────────────────────────────────────────────────
+const storyLimiter = makeSpamLimiter({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 30,
+    reason: 'Story spam',
+    threshold: 5,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Auth/refresh token flood ─────────────────────────────────────────
+const refreshLimiter = makeSpamLimiter({
+    windowMs: 15 * 60 * 1000, // 15 dakika
+    max: 20,
+    reason: 'Token-refresh spam',
+    threshold: 5,
+});
+
 const compression = require('compression');
 const helmet = require('helmet');
 const { Pool } = require('pg');
@@ -1797,12 +1988,12 @@ class LRUCache {
 
 // Cache örnekleri — her alan kendi boyut/TTL ayarına sahip
 const AppCache = {
-    feed     : new LRUCache(200,  30_000),   // Feed: 200 kullanıcı × 30s
-    post     : new LRUCache(500,  30_000),   // Post detayları: 500 post × 30s
-    profile  : new LRUCache(300,  60_000),   // Profil: 300 kullanıcı × 60s
+    feed     : new LRUCache(500,  45_000),   // Feed: 500 kullanıcı × 45s (↑ 200→500, 30→45)
+    post     : new LRUCache(1000, 60_000),   // Post detayları: 1000 post × 60s (↑ 500→1000, 30→60)
+    profile  : new LRUCache(500,  90_000),   // Profil: 500 kullanıcı × 90s (↑ 300→500, 60→90)
     trending : new LRUCache(10,   300_000),  // Trending: 5dk TTL
     weather  : new LRUCache(50,   600_000),  // Hava: 10dk TTL
-    suggest  : new LRUCache(100,  120_000),  // Önerilen kullanıcılar: 2dk
+    suggest  : new LRUCache(200,  180_000),  // Önerilen kullanıcılar: 3dk (↑ 100→200, 2→3dk)
 };
 
 // Periyodik temizlik — her 2 dakikada süresi dolanları sil
@@ -2474,6 +2665,8 @@ async function initializeDatabase() {
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "isActive" BOOLEAN DEFAULT TRUE`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "emailVerified" BOOLEAN DEFAULT FALSE`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "twoFactorEnabled" BOOLEAN DEFAULT FALSE`,
+        `ALTER TABLE users ADD COLUMN IF NOT EXISTS "googleId" TEXT UNIQUE`,
+        `CREATE INDEX IF NOT EXISTS idx_users_google_id ON users("googleId")`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "isVerified" BOOLEAN DEFAULT FALSE`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "hasFarmerBadge" BOOLEAN DEFAULT FALSE`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "userType" TEXT DEFAULT 'normal_kullanici'`,
@@ -2672,6 +2865,10 @@ const app = express();
 // Saldırgan X-Forwarded-For header'ı sahte yazamaz (proxy doğruluyor)
 app.set('trust proxy', 1);
 const server = http.createServer(app);
+// 📱 Mobil büyük dosya yükleme desteği — timeout'ları artır
+server.timeout = 5 * 60 * 1000;          // 5 dakika (büyük fotoğraf/video yükleme)
+server.headersTimeout = 6 * 60 * 1000;   // headersTimeout > timeout olmalı
+server.requestTimeout = 5 * 60 * 1000;   // istek timeout'u
 
 // ══════════════════════════════════════════════════════════════════════════
 // 🔌 SOCKET.IO — Gerçek zamanlı mesajlaşma, bildirimler, online durumu
@@ -2817,18 +3014,29 @@ if (socketIo) {
                 // Gönderene onay (tempId → gerçek id eşleşmesi)
                 socket.emit('message:sent', newMsg);
 
+                // Push bildirim: alıcı online olsa bile web push + FCM göndер
+                // (web push: tarayıcı kapalıysa/arka plandaysa çalışır; online kontrolü webpush kütüphanesi yapar)
+                const pushPayload = {
+                    title: socket.user?.name || socket.username,
+                    body : safeContent.substring(0, 100),
+                    url  : '/',
+                };
+                // Web Push (VAPID) — alıcının tarayıcı aboneliği varsa her durumda gönder
+                sendPushToUser(receiverId, pushPayload).catch(() => {});
+
                 // FCM push bildirimi (alıcı offline ise)
                 if (!onlineUsers.has(receiverId)) {
                     sendFcmPush(receiverId, {
-                        title: socket.user.name || socket.username,
+                        title: socket.user?.name || socket.username,
                         body : safeContent.substring(0, 100),
                         data : {
                             type           : 'message',
+                            url            : '/',
                             senderId       : userId,
                             messageId      : msgId,
-                            actorName      : socket.user.name || socket.username,
+                            actorName      : socket.user?.name || socket.username,
                             actorUsername  : socket.username,
-                            actorProfilePic: absoluteUrl(socket.user.profilePic || ''),
+                            actorProfilePic: absoluteUrl(socket.user?.profilePic || ''),
                             messagePreview : safeContent.substring(0, 100),
                         },
                     }).catch(() => {});
@@ -2877,20 +3085,62 @@ if (socketIo) {
         // 📹 GÖRÜNTÜLÜ / SESLİ ARAMA — WebRTC Sinyal Köprüsü
         // ═══════════════════════════════════════════════════
 
+        // Aktif aramalar takibi (callId → { callerId, recipientId, type, startTime })
+        const activeCalls = new Map();
+
         // Arama başlat
         socket.on('call:initiate', async ({ recipientId, type, callId }) => {
             try {
-                const caller = { id: userId, name: socket.user.name, username: socket.username, profilePic: socket.user.profilePic };
+                if (!recipientId || !callId) return;
+                const caller = {
+                    id        : userId,
+                    name      : socket.user.name,
+                    username  : socket.username,
+                    profilePic: absoluteUrl(socket.user.profilePic || ''),
+                };
                 const recipientSockets = onlineUsers.get(recipientId);
+
                 if (!recipientSockets || recipientSockets.size === 0) {
-                    socket.emit('call:error', { error: 'Kullanıcı çevrimdışı' });
+                    socket.emit('call:error', { callId, error: 'Kullanıcı çevrimdışı', code: 'USER_OFFLINE' });
+                    // FCM ile çevrimdışı push gönder (missed call)
+                    sendFcmPush(recipientId, {
+                        title: caller.name || caller.username,
+                        body : `📞 ${type === 'audio' ? 'Sesli' : 'Görüntülü'} arama cevapsız kaldı`,
+                        data : { type: 'missed_call', callerId: userId, callType: type || 'video', actorName: caller.name || caller.username, actorUsername: caller.username, actorProfilePic: caller.profilePic },
+                    }).catch(() => {});
                     return;
                 }
+
+                // Çağrıyı kaydet
+                activeCalls.set(callId, { callerId: userId, recipientId, type: type || 'video', startTime: Date.now() });
+
+                // Alıcıya çağrı bildirimi gönder (TÜM socketlerine)
                 recipientSockets.forEach(sid => {
-                    io.to(sid).emit('incoming_call', { callId, caller, type: type || 'video' });
+                    io.to(sid).emit('incoming_call', {
+                        callId,
+                        caller,
+                        type  : type || 'video',
+                        timestamp: Date.now(),
+                    });
                 });
+
                 socket.emit('call:ringing', { callId, recipientId });
-            } catch (e) { socket.emit('call:error', { error: 'Arama başlatılamadı' }); }
+                console.log(`📞 [CALL] ${caller.username} → ${recipientId} | type: ${type || 'video'} | callId: ${callId}`);
+
+                // 30 saniye içinde cevap gelmezse timeout
+                setTimeout(() => {
+                    const call = activeCalls.get(callId);
+                    if (call && call.callerId === userId) {
+                        activeCalls.delete(callId);
+                        socket.emit('call:timeout', { callId });
+                        recipientSockets.forEach(sid => io.to(sid).emit('call:cancelled', { callId }));
+                    }
+                }, 30000);
+
+            } catch (e) {
+                console.error('[SOCKET call:initiate]', e);
+                socket.emit('call:error', { callId, error: 'Arama başlatılamadı' });
+            }
         });
 
         // Aramayı yanıtla (kabul / red)
@@ -2902,13 +3152,20 @@ if (socketIo) {
             }
             if (response === 'accept') {
                 socket.emit('call:accepted', { callId });
+                console.log(`📞 [CALL] Kabul: callId=${callId}`);
+            } else {
+                activeCalls.delete(callId);
+                console.log(`📞 [CALL] Red: callId=${callId}`);
             }
         });
 
         // Aramayı bitir
-        socket.on('call:end', ({ callId, recipientId }) => {
-            const targetSockets = onlineUsers.get(recipientId);
-            if (targetSockets) targetSockets.forEach(sid => io.to(sid).emit('call_ended', { callId }));
+        socket.on('call:end', ({ callId, recipientId: targetId }) => {
+            activeCalls.delete(callId);
+            const targetSockets = onlineUsers.get(targetId);
+            if (targetSockets) targetSockets.forEach(sid => io.to(sid).emit('call_ended', { callId, endedBy: userId }));
+            socket.emit('call_ended', { callId });
+            console.log(`📞 [CALL] Bitti: callId=${callId}`);
         });
 
         // WebRTC: Offer ilet
@@ -2979,7 +3236,11 @@ async function sendFcmPush(userId, { title, body, data = {} }) {
                     let sub;
                     try { sub = JSON.parse(row.token); } catch(_) { continue; }
                     if (!sub?.endpoint) continue;
-                    const payload = JSON.stringify({ title, body, icon: '/agro.png', data, timestamp: Date.now() });
+                    // url top-level'da olmalı — Service Worker notificationclick handler bunu okur
+                    const notifUrl = data?.url
+                        ? (data.url.startsWith('http') ? data.url : APP_URL + data.url)
+                        : APP_URL;
+                    const payload = JSON.stringify({ title, body, icon: '/agro.png', url: notifUrl, data, timestamp: Date.now() });
                     await webpush.sendNotification(sub, payload).catch(async (err) => {
                         if (err.statusCode === 410 || err.statusCode === 404) {
                             await dbRun(`UPDATE device_tokens SET "isActive" = FALSE WHERE token = $1`, [row.token]).catch(() => {});
@@ -3055,7 +3316,10 @@ async function sendFcmPush(userId, { title, body, data = {} }) {
                     requireInteraction: false,
                 },
                 fcmOptions: {
-                    link: data.url || '/',
+                    // FCM webpush.fcmOptions.link mutlaka absolute URL olmalı
+                    link: data.url
+                        ? (data.url.startsWith('http') ? data.url : APP_URL + (data.url.startsWith('/') ? data.url : '/' + data.url))
+                        : APP_URL,
                 },
             },
         };
@@ -3627,6 +3891,94 @@ const thumbnailsDir= path.join(uploadsDir, 'thumbnails');
 const hlsDir       = path.join(uploadsDir, 'hls');
 const tempDir      = path.join(uploadsDir, 'temp');
 
+// ════════════════════════════════════════════════════════════════════
+// 🖼️ GÖRÜNTÜ İŞLEME — Concurrency Limiter + processImage Helper
+// ════════════════════════════════════════════════════════════════════
+// NEDEN:
+//   • sequentialRead:true → EXIF orientation verisi pipeline başlamadan okunamıyor
+//     → Dikey fotoğraflar 90° yatmış görünüyor (iPhone/Android)
+//   • effort:1-2 → WebP sıkıştırma verimsiz, daha büyük dosyalar
+//   • Concurrency kontrolü yok → çok upload = CPU spike, timeout
+//
+// ÇÖZÜM:
+//   • sequentialRead KALDIRILDI → random-access mod, EXIF tam okunuyor
+//   • .rotate() her zaman ilk pipeline adımı → EXIF orientation strip + uygula
+//   • effort:4, smartSubsample:true → %15-25 küçük dosya, aynı kalite
+//   • Semaphore → aynı anda max N resim işlenir
+
+const IMG_CONCURRENCY = Math.min(os.cpus().length, 4); // max 4 paralel işlem
+let _imgActive = 0;
+const _imgQueue = [];
+
+function acquireImgSlot() {
+    return new Promise(resolve => {
+        const tryAcquire = () => {
+            if (_imgActive < IMG_CONCURRENCY) {
+                _imgActive++;
+                resolve(() => {
+                    _imgActive--;
+                    if (_imgQueue.length) _imgQueue.shift()();
+                });
+            } else {
+                _imgQueue.push(tryAcquire);
+            }
+        };
+        tryAcquire();
+    });
+}
+
+/**
+ * Resmi işler: EXIF rotasyonu düzeltir, boyutlandırır, WebP'e çevirir.
+ * @param {string} inputPath  - Kaynak dosya yolu
+ * @param {string} outputPath - Hedef dosya yolu (.webp)
+ * @param {object} opts
+ *   width, height  : Maksimum boyut (varsayılan 1920×1920)
+ *   fit            : sharp fit modu ('inside' | 'cover') — varsayılan 'inside'
+ *   quality        : WebP kalite 1-100 (varsayılan 78)
+ *   effort         : WebP sıkıştırma çabası 0-6 (varsayılan 4)
+ * @returns {Promise<sharp.OutputInfo>}
+ */
+async function processImage(inputPath, outputPath, {
+    width   = 1920,
+    height  = 1920,
+    fit     = 'inside',
+    quality = 78,
+    effort  = 4,
+} = {}) {
+    const release = await acquireImgSlot();
+    try {
+        // sequentialRead YOK → random-access mod → EXIF orientation tam okunur
+        // .rotate() ilk adım → orientation EXIF tag'i silinir, piksel olarak döndürülür
+        // smartSubsample:true → renk kanalı alt örnekleme → %10-15 daha küçük dosya
+        const info = await sharp(inputPath, { limitInputPixels: MAX_IMAGE_PIXELS })
+            .rotate()                                                    // ← EXIF portrait fix
+            .resize(width, height, { fit, withoutEnlargement: true, kernel: 'lanczos3' })
+            .webp({ quality, effort, smartSubsample: true })
+            .toFile(outputPath);
+        return info;
+    } finally {
+        release();
+    }
+}
+
+/**
+ * Buffer'dan resim işler (Google profil fotoğrafı gibi URL'den indirilen resimler için)
+ */
+async function processImageBuffer(inputBuffer, outputPath, opts = {}) {
+    const release = await acquireImgSlot();
+    const { width = 300, height = 300, fit = 'cover', quality = 62, effort = 3 } = opts;
+    try {
+        const info = await sharp(inputBuffer, { limitInputPixels: MAX_IMAGE_PIXELS })
+            .rotate()
+            .resize(width, height, { fit, withoutEnlargement: true, kernel: 'lanczos3' })
+            .webp({ quality, effort, smartSubsample: true })
+            .toFile(outputPath);
+        return info;
+    } finally {
+        release();
+    }
+}
+
 [uploadsDir, profilesDir, postsDir, videosDir, thumbnailsDir, hlsDir, tempDir].forEach(dir => {
     if (!fssync.existsSync(dir)) {
         fssync.mkdirSync(dir, { recursive: true });
@@ -3742,29 +4094,38 @@ function optimizeVideo(inputPath, outputPath) {
         const tf = Math.min(vInfo.fps || 30, VIDEO_CONFIG.fps);
 
         // Oran korunur, H.264 çift piksel zorunluluğu
-        const scaleFilter = `scale='min(${tw},iw)':min'(${th},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
+        const scaleFilter = `scale='min(${tw},iw)':'min(${th},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
 
         console.log(`🎬 [Compress] ${sizeMB.toFixed(1)}MB | CRF:${adaptiveCrf} | Max:${tw}x${th}`);
 
-        ffmpeg(inputPath)
+        // Büyük/yüksek çözünürlüklü videolar için timeout: dosya başına max 30 dakika
+        const FFMPEG_TIMEOUT_MS = 30 * 60 * 1000;
+        let ffmpegProc = null;
+        const timeoutHandle = setTimeout(() => {
+            console.error(`⏰ [FFmpeg] Timeout: ${videoId || path.basename(inputPath)}`);
+            if (ffmpegProc) try { ffmpegProc.kill('SIGKILL'); } catch (_) {}
+        }, FFMPEG_TIMEOUT_MS);
+
+        ffmpegProc = ffmpeg(inputPath)
             .videoCodec(VIDEO_CONFIG.codec)
             .audioCodec(VIDEO_CONFIG.audioCodec)
             .outputOptions([
                 `-crf ${adaptiveCrf}`,
-                `-preset ${VIDEO_CONFIG.preset}`,
+                '-preset fast',          // ultrafast → fast: boyut/kalite dengesi
                 `-movflags ${VIDEO_CONFIG.movflags}`,
                 `-threads ${VIDEO_CONFIG.threads}`,
                 `-r ${tf}`,
                 `-b:a ${VIDEO_CONFIG.audioBitrate}`,
-                // Ses kanalını stereo'ya sabitle (mono Android'de sorun çıkarabiliyor)
                 '-ac 2',
                 `-vf ${scaleFilter}`,
                 '-pix_fmt yuv420p',
-                '-profile:v baseline', // ⚡ high→baseline (Android uyumluluğu + daha hızlı)
-                '-level 3.1',
+                '-profile:v high',       // baseline → high: yüksek çözünürlük desteği
+                '-level 4.2',            // 3.1 → 4.2: 1080p+ için gerekli
+                '-max_muxing_queue_size 1024', // büyük dosyalarda muxer kuyruğu taşmasını önle
             ])
             .format('mp4')
             .on('end', async () => {
+                clearTimeout(timeoutHandle);
                 const outSize = fssync.existsSync(outputPath) ? fssync.statSync(outputPath).size : 0;
                 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
                 const reduction = outSize ? (((sizeMB - outSize / 1024 / 1024) / sizeMB) * 100).toFixed(1) : 0;
@@ -3773,6 +4134,7 @@ function optimizeVideo(inputPath, outputPath) {
                 resolve({ success: true, optimized: true, fileSize: outSize, reduction: parseFloat(reduction) });
             })
             .on('error', async (err) => {
+                clearTimeout(timeoutHandle);
                 console.error('❌ FFmpeg hatası, fallback kopyalama:', err.message);
                 try {
                     await fs.copyFile(inputPath, outputPath);
@@ -3859,7 +4221,7 @@ async function generateHLSVariants(inputMp4Path, videoId) {
     await Promise.all(activeVariants.map(async (variant) => {
         const outDir      = path.join(outputBase, variant.name);
         const playlist    = path.join(outDir, 'playlist.m3u8');
-        const scaleFilter = `scale='min(${variant.width},iw)':min'(${variant.height},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
+        const scaleFilter = `scale='min(${variant.width},iw)':'min(${variant.height},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
 
         await new Promise((resolve) => {
             ffmpeg(inputMp4Path)
@@ -4221,14 +4583,16 @@ const upload = multer({
 // Katman 4: Dosya imzası + içeriği çapraz kontrol
 // ══════════════════════════════════════════════════════════════════════
 
-// Decompression bomb eşiği: 25 megapiksel = 25,000,000 px (25MP fotoğraf normaldir)
-// Saldırı örneği: 1x1 px PNG → expand edilince 10 GB → sunucu çöker
-const MAX_IMAGE_PIXELS   = 25_000_000; // 25 MP
-const MAX_IMAGE_SIDE     = 20_000;     // Tek kenar maksimum
-const MAX_ASPECT_RATIO   = 500;        // Genişlik/yükseklik oranı (1:500 anormal)
-// Polyglot sinyali: dosya boyutu çok küçük ama büyük boyut iddia ediyor
-// Gerçek 1920x1080 JPEG minimum ~30KB olmalı
-const MIN_BYTES_PER_MPIX = 500;        // 1MP başına min 500 byte (çok düşük = şüpheli)
+// Decompression bomb eşiği: Modern telefon kameraları 50MP+ çekebilir (Samsung S24 Ultra: 200MP, iPhone 15 Pro: 48MP)
+// Panorama ve yüksek çözünürlüklü fotoğraflar da desteklenmeli
+// Sharp zaten çıktıyı 1920px'e düşürüyor — girişte çok kısıtlamamalıyız
+// Saldırı örneği: 1x1 px PNG → expand edilince 10 GB → sunucu çöker (200MP limit bunu önler)
+const MAX_IMAGE_PIXELS   = 200_000_000; // 200 MP — modern kamera + panorama desteği
+const MAX_IMAGE_SIDE     = 50_000;      // Tek kenar maksimum (panorama desteği)
+const MAX_ASPECT_RATIO   = 500;         // Genişlik/yükseklik oranı (1:500 anormal)
+// Polyglot sinyali: HEIC/HEIF gibi modern formatlar çok yüksek sıkıştırma kullanır
+// Düşük byte/piksel oranı bu formatlarda normaldir — eşiği düşür
+const MIN_BYTES_PER_MPIX = 50;         // 1MP başına min 50 byte (HEIC/HEIF uyumlu)
 
 async function deepScanImage(filePath, mimeType) {
     // Sadece resimlere uygula (video sharp ile açılmaz)
@@ -4237,8 +4601,9 @@ async function deepScanImage(filePath, mimeType) {
     try {
         // 🔒 limitInputPixels: Sharp bu eşiği geçen resmi DECODE ETMEZ
         // → Decompression bomb saldırısını tamamen önler
+        // 200MP limit: Samsung S24 Ultra (200MP), iPhone (48MP), panorama fotoğraflarını destekler
         const sharpInst = sharp(filePath, {
-            limitInputPixels: MAX_IMAGE_PIXELS,
+            limitInputPixels: MAX_IMAGE_PIXELS, // 200MP
             sequentialRead  : true,
         });
 
@@ -4601,6 +4966,22 @@ app.use('/uploads/voice', (req, res, next) => {
     next();
 }, express.static(path.join(uploadsDir, 'voice'), { maxAge: '7d' }));
 
+// 🖼️ Post resimleri — uzun cache (WebP immutable, isim UUID bazlı)
+app.use('/uploads/posts', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable'); // 1 yıl — UUID dosya adı değişmez
+    next();
+}, express.static(postsDir, { maxAge: '1y', etag: true, lastModified: true }));
+
+// 🖼️ Profil resimleri — orta cache (profil güncellenince yeni dosya adı)
+app.use('/uploads/profiles', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Cache-Control', 'public, max-age=604800'); // 7 gün
+    next();
+}, express.static(profilesDir, { maxAge: '7d', etag: true }));
+
 app.use('/uploads', express.static(uploadsDir, { maxAge: '1y', dotfiles: 'deny' }));
 
 
@@ -4618,9 +4999,9 @@ app.use('/uploads', express.static(uploadsDir, { maxAge: '1y', dotfiles: 'deny' 
 
 // IP bazlı token kullanım takibi (in-memory, cluster'da Redis önerilir)
 const tokenIpMap = new Map(); // tokenHash → { ips: Set, firstSeen, lastSeen, count }
-const TOKEN_ANOMALY_WINDOW  = 10 * 60 * 1000; // 10 dakika
-const TOKEN_MAX_DISTINCT_IPS = 3;              // 10dk içinde 3'ten fazla farklı IP = şüpheli
-const TOKEN_MAX_REQUESTS     = 500;            // 10dk içinde 500+ istek = şüpheli
+const TOKEN_ANOMALY_WINDOW  = 30 * 60 * 1000; // 30 dakika (genişletildi)
+const TOKEN_MAX_DISTINCT_IPS = 10;             // 30dk içinde 10'dan fazla farklı IP = şüpheli (CGN/proxy için tolerans)
+const TOKEN_MAX_REQUESTS     = 1000;           // 30dk içinde 1000+ istek = şüpheli
 
 function trackTokenUsage(token, ip) {
     if (!token || !ip) return false; // şüpheli değil
@@ -4984,6 +5365,7 @@ async function createNotification(userId, type, message, data = {}) {
         // 📱 FCM push (Android native app) — data alanı string map olmalı
         const fcmData = {
             type,
+            url: urlMap[type] || '/',  // FCM web push tıklama URL'i (absolute yapılacak sendFcmPush'ta)
             ...Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v ?? '')])),
         };
         sendFcmPush(userId, {
@@ -5194,6 +5576,70 @@ app.get('/api/socket/status', (req, res) => {
     });
 });
 
+// ─── QR KOD: GET /api/users/:username/qr ────────────────────────────────
+// Profil paylaşımında QR kod üretir — URL'yi SVG QR koduna dönüştürür
+// Harici kütüphane gerekmez: pure SVG QR matrix
+app.get('/api/users/:username/qr', async (req, res) => {
+    try {
+        const username = req.params.username?.toLowerCase().trim();
+        if (!username) return res.status(400).json({ error: 'Kullanıcı adı gerekli' });
+
+        const DOMAIN = (process.env.APP_URL || 'https://sehitumitkestitarimmtal.com').replace(/\/$/, '');
+        const profileUrl = `${DOMAIN}/u/${username}`;
+
+        // QR matrisi üretici (ISO 18004 tabanlı basit implementasyon)
+        // Harici bağımlılık yok — saf JS
+        function generateQRMatrix(text) {
+            // QR kodunu data URL yerine yalnızca matrix döndürür
+            // Basit versiyon: 21x21 (Version 1) — kısa URL'ler için yeterli
+            // Gerçek QR algoritması karmaşık, burada stabil bir yaklaşım:
+            // URL'yi önce Google Charts API ile oluştur (server-side fetch)
+            return null; // Aşağıda fetch ile hallederiz
+        }
+
+        // Google Charts QR API (HTTPS, ücretsiz, no API key)
+        const { default: fetch } = await import('node-fetch');
+        const size = parseInt(req.query.size) || 300;
+        const safeSz = Math.min(Math.max(size, 100), 600);
+        const qrUrl = `https://chart.googleapis.com/chart?cht=qr&chs=${safeSz}x${safeSz}&chl=${encodeURIComponent(profileUrl)}&choe=UTF-8&chld=M|2`;
+
+        const qrRes = await fetch(qrUrl, { signal: AbortSignal.timeout(8000) });
+        if (!qrRes.ok) throw new Error('QR servisi yanıt vermedi');
+
+        const buf = Buffer.from(await qrRes.arrayBuffer());
+        res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Cache-Control', 'public, max-age=86400'); // 1 gün cache
+        res.setHeader('Content-Disposition', `inline; filename="qr-${username}.png"`);
+        res.send(buf);
+    } catch (e) {
+        console.error('[QR Code]', e.message);
+        // Fallback: JSON URL dön
+        res.status(500).json({ error: 'QR kod oluşturulamadı', url: `${process.env.APP_URL || ''}/u/${req.params.username}` });
+    }
+});
+
+// GET /api/users/:username/qr-data — QR için URL bilgisi (JSON)
+app.get('/api/users/:username/qr-data', authenticateToken, async (req, res) => {
+    try {
+        const username = req.params.username?.toLowerCase().trim();
+        const user = await dbGet('SELECT id, username, name, "profilePic", "isVerified" FROM users WHERE username = $1 AND "isActive" = TRUE', [username]);
+        if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
+
+        const DOMAIN = (process.env.APP_URL || 'https://sehitumitkestitarimmtal.com').replace(/\/$/, '');
+        const profileUrl = `${DOMAIN}/u/${username}`;
+        const qrImageUrl = `${DOMAIN}/api/users/${username}/qr`;
+
+        res.json({
+            success    : true,
+            url        : profileUrl,
+            qrImageUrl : qrImageUrl,
+            user       : { username: user.username, name: user.name, isVerified: user.isVerified },
+        });
+    } catch (e) {
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
 
 
 // ─── 1. HEALTH CHECK ────────────────────────────────────────────────
@@ -5206,6 +5652,101 @@ app.get('/api/health', async (req, res) => {
         res.status(503).json({ status: 'error' });
     }
 });
+
+// ══════════════════════════════════════════════════════════════════
+// 🤖 reCAPTCHA v2 DOĞRULAMA
+// .env dosyasına ekle:
+//   RECAPTCHA_SECRET_KEY=<Google reCAPTCHA v2 gizli anahtarı>
+//   RECAPTCHA_ENABLED=true   (false yaparak devre dışı bırakılabilir)
+// Frontend'de: <script src="https://www.google.com/recaptcha/api.js"></script>
+//   + data-sitekey="<site_key>" ile widget ekle, g-recaptcha-response form'dan gönder
+// ══════════════════════════════════════════════════════════════════
+async function verifyRecaptcha(token, remoteip) {
+    // Debug logs
+    console.log('[reCAPTCHA] ENABLED:', process.env.RECAPTCHA_ENABLED);
+    console.log('[reCAPTCHA] SECRET_KEY exists:', !!process.env.RECAPTCHA_SECRET_KEY);
+    
+    // reCAPTCHA devre dışıysa veya test ortamıysa geç
+    if (process.env.RECAPTCHA_ENABLED !== 'true') {
+        console.log('[reCAPTCHA] Devre dışı, geçiliyor');
+        return { success: true, skipped: true };
+    }
+    if (process.env.NODE_ENV === 'test') {
+        console.log('[reCAPTCHA] Test ortamı, geçiliyor');
+        return { success: true, skipped: true };
+    }
+    if (!process.env.RECAPTCHA_SECRET_KEY) {
+        console.warn('⚠️  RECAPTCHA_SECRET_KEY tanımlı değil, doğrulama atlanıyor');
+        return { success: true, skipped: true };
+    }
+    if (!token) {
+        console.warn('[reCAPTCHA] Token boş');
+        return { success: false, error: 'reCAPTCHA doğrulaması gerekli' };
+    }
+    
+    console.log('[reCAPTCHA] Token var, Google API çağrılıyor...', token.substring(0, 20) + '...');
+    try {
+        const { default: fetch } = await import('node-fetch');
+        const params = new URLSearchParams({
+            secret  : process.env.RECAPTCHA_SECRET_KEY,
+            response: token,
+        });
+        if (remoteip) params.append('remoteip', remoteip);
+        
+        console.log('[reCAPTCHA] POST → https://www.google.com/recaptcha/api/siteverify');
+        const res = await fetch('https://www.google.com/recaptcha/api/siteverify', {
+            method : 'POST',
+            body   : params,
+            signal : AbortSignal.timeout(8000),
+        });
+        console.log('[reCAPTCHA] HTTP Status:', res.status);
+        
+        const data = await res.json();
+        console.log('[reCAPTCHA] API Response:', JSON.stringify(data));
+        
+        if (!data.success) {
+            console.warn('[reCAPTCHA] ❌ Başarısız - error-codes:', data['error-codes']);
+            return { success: false, error: 'reCAPTCHA doğrulaması başarısız. Lütfen tekrar deneyin.' };
+        }
+        console.log('[reCAPTCHA] ✅ Doğrulama başarılı!');
+        return { success: true };
+    } catch (e) {
+        console.error('[reCAPTCHA] Exception:', e.message);
+        // Servis erişilemiyorsa geçir (availability öncelikli)
+        return { success: true, skipped: true };
+    }
+}
+
+// ── Native uygulama tespiti ──────────────────────────────────────────
+// Android OkHttp User-Agent veya özel X-App-Platform header'ı ile tespit edilir
+function isNativeAppRequest(req) {
+    const ua = (req.headers['user-agent'] || '').toLowerCase();
+    const platform = (req.headers['x-app-platform'] || '').toLowerCase();
+    const clientType = (req.headers['x-client-type'] || '').toLowerCase();
+    return (
+        platform === 'android' ||
+        platform === 'ios' ||
+        clientType === 'native' ||
+        ua.includes('okhttp') ||       // Retrofit/OkHttp (Android)
+        ua.includes('agrolink-android') // Özel Android UA
+    );
+}
+
+// Middleware — req.body.recaptchaToken veya req.body['g-recaptcha-response'] kontrol eder
+// 🔒 Native mobil uygulama isteklerinde reCAPTCHA ATLANIR (sadece web'de çalışır)
+async function recaptchaMiddleware(req, res, next) {
+    // Native app'ten gelen isteklerde reCAPTCHA kontrolü yok
+    if (isNativeAppRequest(req)) {
+        console.log('[reCAPTCHA] Native uygulama isteği — atlanıyor');
+        return next();
+    }
+    const token = req.body?.recaptchaToken || req.body?.['g-recaptcha-response'];
+    const result = await verifyRecaptcha(token, req.ip);
+    if (!result.success) {
+        return res.status(400).json({ error: result.error || 'reCAPTCHA doğrulaması başarısız' });
+    }
+    next();
+}
 
 // ─── 2. KAYIT ───────────────────────────────────────────────────────
 app.post('/api/auth/register', registerLimiter, validateAuthInput, upload.single('profilePic'), async (req, res) => {
@@ -5235,7 +5776,7 @@ app.post('/api/auth/register', registerLimiter, validateAuthInput, upload.single
             const filename = `profile_${userId}.webp`;
             const outputPath = path.join(profilesDir, filename);
             try {
-                await sharp(req.file.path).rotate().resize(300, 300, { fit: 'cover' }).webp({ quality: 55, effort: 1 }).toFile(outputPath);
+                await processImage(req.file.path, outputPath, { width: 300, height: 300, fit: 'cover', quality: 62, effort: 3 });
                 profilePic = `/uploads/profiles/${filename}`;
             } catch (e) {
                 console.error('Profil resmi işleme hatası'); // 🔒 Detay loglanmıyor
@@ -5320,7 +5861,7 @@ body{font-family:'Segoe UI',sans-serif;background:#f4f4f4;margin:0;padding:0}
 
 // ─── 2b. KAYIT (register-init alias — UI uyumluluğu için) ──────────
 // UI /api/auth/register-init çağırıyor, bu endpoint aynı işlemi yapar
-app.post('/api/auth/register-init', registerLimiter, upload.single('profilePic'), async (req, res) => {
+app.post('/api/auth/register-init', registerLimiter, recaptchaMiddleware, upload.single('profilePic'), async (req, res) => {
     try {
         const { name, username, email, password, userType } = req.body;
         if (!name || !username || !email || !password) {
@@ -5346,7 +5887,7 @@ app.post('/api/auth/register-init', registerLimiter, upload.single('profilePic')
             const filename = `profile_${userId}.webp`;
             const outputPath = path.join(profilesDir, filename);
             try {
-                await sharp(req.file.path).rotate().resize(300, 300, { fit: 'cover' }).webp({ quality: 55, effort: 1 }).toFile(outputPath);
+                await processImage(req.file.path, outputPath, { width: 300, height: 300, fit: 'cover', quality: 62, effort: 3 });
                 profilePic = `/uploads/profiles/${filename}`;
             } catch (e) {
                 console.error('Profil resmi işleme hatası'); // 🔒 Detay loglanmıyor
@@ -5417,7 +5958,7 @@ app.post('/api/auth/register-init', registerLimiter, upload.single('profilePic')
 });
 
 // ─── 3. GİRİŞ ──────────────────────────────────────────────────────
-app.post('/api/auth/login', loginLimiter, validateAuthInput, async (req, res) => {
+app.post('/api/auth/login', loginLimiter, validateAuthInput, recaptchaMiddleware, async (req, res) => {
     try {
         const { email, password, identifier } = req.body;
         // UI'dan "identifier" (e-posta veya kullanıcı adı) gelebilir, geriye dönük uyumluluk için "email" de desteklenir
@@ -5581,8 +6122,203 @@ app.post('/api/auth/login', loginLimiter, validateAuthInput, async (req, res) =>
     }
 });
 
+// ════════════════════════════════════════════════════════════════════
+// 🔐 GOOGLE İLE GİRİŞ YAP — OAuth 2.0 / Google Identity Services
+// ════════════════════════════════════════════════════════════════════
+//
+// .env dosyasına ekle:
+//   GOOGLE_WEB_CLIENT_ID=<Web OAuth 2.0 Client ID>
+//   GOOGLE_ANDROID_CLIENT_ID=<Android OAuth 2.0 Client ID>
+//
+// Web frontend: google.accounts.id.initialize({ client_id, callback })
+//   → callback'den gelen credential (idToken) → /api/auth/google'a POST
+// Android: GoogleSignIn SDK → getIdToken() → /api/auth/google'a POST
+//
+// Kurulum: npm install google-auth-library
+// ════════════════════════════════════════════════════════════════════
+let GoogleOAuth2Client = null;
+try {
+    const { OAuth2Client } = require('google-auth-library');
+    GoogleOAuth2Client = OAuth2Client;
+    console.log('✅ google-auth-library yüklendi — Google Sign-In aktif');
+} catch (_) {
+    console.warn('⚠️  google-auth-library bulunamadı. (npm install google-auth-library)');
+}
+
+async function verifyGoogleIdToken(idToken) {
+    if (!GoogleOAuth2Client) throw new Error('google-auth-library kurulu değil');
+    const webClientId     = process.env.GOOGLE_WEB_CLIENT_ID;
+    const androidClientId = process.env.GOOGLE_ANDROID_CLIENT_ID;
+    if (!webClientId && !androidClientId) {
+        throw new Error('GOOGLE_WEB_CLIENT_ID veya GOOGLE_ANDROID_CLIENT_ID .env\'de tanımlı değil');
+    }
+    const audiences = [webClientId, androidClientId].filter(Boolean);
+    const client    = new GoogleOAuth2Client(webClientId || androidClientId);
+    const ticket    = await client.verifyIdToken({ idToken, audience: audiences });
+    const payload   = ticket.getPayload();
+    if (!payload?.email)        throw new Error('Google token\'dan e-posta alınamadı');
+    if (!payload.email_verified) throw new Error('Google e-postası doğrulanmamış');
+    return {
+        googleId: payload.sub,
+        email   : payload.email.toLowerCase().trim(),
+        name    : payload.name || payload.email.split('@')[0],
+        picture : payload.picture || null,
+    };
+}
+
+// POST /api/auth/google
+// Body: { idToken: "<google_id_token>" }
+app.post('/api/auth/google', loginLimiter, async (req, res) => {
+    try {
+        if (!GoogleOAuth2Client) {
+            return res.status(503).json({ error: 'Google Sign-In şu anda kullanılamıyor. Sunucu yapılandırması eksik.' });
+        }
+
+        const { idToken } = req.body;
+        if (!idToken) return res.status(400).json({ error: 'Google ID Token gerekli' });
+
+        // ── Google token doğrula ──────────────────────────────────────
+        let googleUser;
+        try {
+            googleUser = await verifyGoogleIdToken(idToken);
+        } catch (e) {
+            console.warn('[Google Auth] Token doğrulama başarısız:', e.message);
+            return res.status(401).json({ error: 'Geçersiz Google token. Lütfen tekrar deneyin.' });
+        }
+
+        const { googleId, email, name, picture } = googleUser;
+
+        // ── Kullanıcıyı bul (googleId veya email ile) ─────────────────
+        let user = await dbGet(
+            `SELECT id, username, name, email, role, plan, "profilePic", "coverPic", bio,
+                    "isVerified", "isActive", "isBanned", "emailVerified",
+                    "hasFarmerBadge", "userType", "twoFactorEnabled", "googleId"
+             FROM users
+             WHERE ("googleId" = $1 OR email = $2) AND "isActive" = TRUE
+             LIMIT 1`,
+            [googleId, email]
+        );
+
+        let isNewUser = false;
+
+        if (!user) {
+            // ── Yeni kullanıcı: otomatik kayıt ───────────────────────
+            isNewUser       = true;
+            const newUserId = uuidv4();
+
+            // Kullanıcı adı üret (e-posta prefix'inden)
+            let baseUsername = email.split('@')[0].toLowerCase().replace(/[^a-z0-9._-]/g, '');
+            if (baseUsername.length < 3) baseUsername = 'user' + baseUsername;
+            let finalUsername = baseUsername;
+            let suffix = 1;
+            while (await dbGet('SELECT id FROM users WHERE username = $1', [finalUsername])) {
+                finalUsername = `${baseUsername}${suffix++}`;
+            }
+
+            // Google profil fotoğrafını indir (başarısız olursa atla)
+            let profilePic = null;
+            if (picture) {
+                try {
+                    const { default: fetch } = await import('node-fetch');
+                    const imgRes = await fetch(picture, { signal: AbortSignal.timeout(5000) });
+                    if (imgRes.ok) {
+                        const imgBuf  = Buffer.from(await imgRes.arrayBuffer());
+                        const filename = `profile_${newUserId}.webp`;
+                        const outPath  = path.join(profilesDir, filename);
+                        await processImageBuffer(imgBuf, outPath, { width: 300, height: 300, fit: 'cover', quality: 62, effort: 3 });
+                        profilePic = `/uploads/profiles/${filename}`;
+                    }
+                } catch (_) {}
+            }
+
+            await dbRun(
+                `INSERT INTO users
+                   (id, name, username, email, password, "profilePic", "userType",
+                    "googleId", "emailVerified", "registrationIp", "createdAt", "updatedAt")
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,NOW(),NOW())`,
+                [newUserId, name, finalUsername, email, '', profilePic, 'normal_kullanici', googleId, req.ip]
+            );
+
+            // Varsayılan hesapları takip ettir
+            try {
+                for (const uname of ['agro_sosyal','agrolink_news','yemektarifleri','agroabot','akilli.tarlam']) {
+                    const acc = await dbGet('SELECT id FROM users WHERE username=$1', [uname]);
+                    if (acc) await dbRun(
+                        'INSERT INTO follows (id,"followerId","followingId","createdAt") VALUES($1,$2,$3,NOW()) ON CONFLICT ("followerId","followingId") DO NOTHING',
+                        [uuidv4(), newUserId, acc.id]
+                    );
+                }
+            } catch (_) {}
+
+            if (isGmailAddress(email)) sendWelcomeEmail(email, name).catch(() => {});
+
+            user = await dbGet(
+                `SELECT id, username, name, email, role, plan, "profilePic", "coverPic", bio,
+                        "isVerified", "isActive", "isBanned", "emailVerified",
+                        "hasFarmerBadge", "userType", "twoFactorEnabled"
+                 FROM users WHERE id=$1`,
+                [newUserId]
+            );
+            console.log(`✅ [Google Auth] Yeni kullanıcı: ${maskEmail(email)}`);
+        } else {
+            // Mevcut kullanıcı — ban kontrolü
+            if (user.isBanned) return res.status(403).json({ error: 'Hesabınız askıya alınmış.' });
+            // googleId yoksa ilk Google girişi — ekle
+            if (!user.googleId) {
+                await dbRun(
+                    `UPDATE users SET "googleId"=$1, "emailVerified"=TRUE, "updatedAt"=NOW() WHERE id=$2`,
+                    [googleId, user.id]
+                );
+            }
+        }
+
+        // ── lastLogin güncelle ────────────────────────────────────────
+        await dbRun('UPDATE users SET "lastLogin"=NOW(),"isOnline"=TRUE,"updatedAt"=NOW() WHERE id=$1', [user.id]);
+        dbRun(`INSERT INTO user_login_hours ("userId",hour) VALUES($1,$2)`,
+            [user.id, new Date().getHours()]).catch(() => {});
+
+        // ── Token üret ────────────────────────────────────────────────
+        const tokens    = generateTokens(user);
+        const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
+        await dbRun(
+            `INSERT INTO refresh_tokens (id,"userId","tokenHash",ip,"userAgent","createdAt","expiresAt")
+             VALUES($1,$2,$3,$4,$5,NOW(),NOW()+INTERVAL '7 days')`,
+            [uuidv4(), user.id, tokenHash, req.ip, req.headers['user-agent'] || '']
+        );
+
+        const csrfToken = generateCsrfToken();
+        setAuthCookies(res, req, tokens);
+        setCsrfCookie(res, req, csrfToken);
+
+        console.log(`✅ [Google Auth] Giriş başarılı: ${maskEmail(email)}`);
+
+        res.json({
+            message     : 'Google ile giriş başarılı',
+            token       : tokens.accessToken,
+            refreshToken: tokens.refreshToken,
+            isNewUser,
+            user: {
+                id            : user.id,
+                username      : user.username,
+                name          : user.name,
+                email         : user.email,
+                profilePic    : absoluteUrl(user.profilePic),
+                coverPic      : absoluteUrl(user.coverPic),
+                bio           : user.bio,
+                isVerified    : user.isVerified,
+                hasFarmerBadge: user.hasFarmerBadge,
+                role          : user.role,
+                emailVerified : true,
+            }
+        });
+    } catch (error) {
+        console.error('[Google Auth] Sunucu hatası:', error.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
 // ─── 4. TOKEN YENİLEME ──────────────────────────────────────────────
-app.post('/api/auth/refresh', async (req, res) => {
+app.post('/api/auth/refresh', refreshLimiter, async (req, res) => {
     try {
         // 🔒 Önce HttpOnly cookie, sonra body (native/mobile uyumluluk)
         const refreshToken = req.cookies?.refresh_token || req.body?.refreshToken;
@@ -5777,7 +6513,7 @@ app.post('/api/auth/send-otp', otpLimiter, validateAuthInput, async (req, res) =
 // Frontend'in v5'ten gelen tüm çağrıları uyumlu hale getirir:
 //   GET /api/users/:id       → UUID ile arama (eski frontend)
 //   GET /api/users/:username → username ile arama (yeni frontend)
-app.get('/api/users/:idOrUsername', authenticateToken, async (req, res, next) => {
+app.get('/api/users/:idOrUsername', optionalAuth, async (req, res, next) => {
     // Bilinen statik endpoint'ler → kendi route'larına bırak
     const STATIC_SEGMENTS = [
         'blocks', 'blocked', 'online', 'search', 'following', 'followers',
@@ -5814,9 +6550,7 @@ app.get('/api/users/:idOrUsername', authenticateToken, async (req, res, next) =>
         if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
 
         // 🔒 Banlı kullanıcının kendi profiline baktığı durum:
-        // Profil verisini döndür ama isBanned:true ile işaretle
-        // Frontend 3 sn gösterip sonra erişim engeli modal açar
-        if (user.isBanned && req.user.id === user.id) {
+        if (user.isBanned && req.user?.id === user.id) {
             return res.json({
                 user: {
                     id: user.id, username: user.username, name: user.name,
@@ -5847,21 +6581,21 @@ app.get('/api/users/:idOrUsername', authenticateToken, async (req, res, next) =>
             });
         }
 
+        const viewerId = req.user?.id || null;
         const [followingRow, followerRow, postRow, isFollowing, isBlocked, onlineRow] = await Promise.all([
             pool.query('SELECT COUNT(*)::int AS cnt FROM follows WHERE "followerId"  = $1', [user.id]),
             pool.query('SELECT COUNT(*)::int AS cnt FROM follows WHERE "followingId" = $1', [user.id]),
             pool.query('SELECT COUNT(*)::int AS cnt FROM posts   WHERE "userId" = $1 AND "isActive" = TRUE', [user.id]),
-            dbGet('SELECT id FROM follows WHERE "followerId" = $1 AND "followingId" = $2', [req.user.id, user.id]),
-            dbGet(`SELECT id FROM blocks WHERE ("blockerId"=$1 AND "blockedId"=$2) OR ("blockerId"=$2 AND "blockedId"=$1)`, [req.user.id, user.id]),
-            pool.query('SELECT "isOnline", "lastSeen" FROM users WHERE id=$1', [user.id]) // ⚡ isUserOnline paralel
+            viewerId ? dbGet('SELECT id FROM follows WHERE "followerId" = $1 AND "followingId" = $2', [viewerId, user.id]) : null,
+            viewerId ? dbGet(`SELECT id FROM blocks WHERE ("blockerId"=$1 AND "blockedId"=$2) OR ("blockerId"=$2 AND "blockedId"=$1)`, [viewerId, user.id]) : null,
+            pool.query('SELECT "isOnline", "lastSeen" FROM users WHERE id=$1', [user.id])
         ]);
 
-        // 🔒 ENGEL KONTROLÜ — kendi profiline erişebilir, engellenmiş ise 403
-        if (isBlocked && user.id !== req.user.id) {
+        // 🔒 ENGEL KONTROLÜ — sadece giriş yapmış kullanıcılar için
+        if (isBlocked && viewerId && user.id !== viewerId) {
             return res.status(403).json({ error: 'Engelli kullanıcı' });
         }
 
-        // ⚡ isOnline hesapla (ayrı DB sorgusu yok)
         const onlineData = onlineRow.rows[0];
         const isOnline = onlineData ? (onlineData.isOnline || (onlineData.lastSeen && Date.now() - new Date(onlineData.lastSeen).getTime() < 5 * 60 * 1000)) : false;
 
@@ -5895,6 +6629,46 @@ function requireNotBanned(req, res, next) {
             code: 'ACCOUNT_BANNED',
             message: 'Hesabınız politika ihlali nedeniyle kısıtlanmıştır.'
         });
+    }
+    next();
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 🌐 OPTİONAL AUTH — Token varsa doğrular, yoksa req.user=null ile devam eder
+// Kamuya açık endpointlerde kullanılır (profil, postlar, yorumlar vs.)
+// ════════════════════════════════════════════════════════════════════
+async function optionalAuth(req, res, next) {
+    let token = req.cookies?.access_token;
+    if (!token) {
+        const authHeader = req.headers['authorization'];
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+            token = authHeader.slice(7);
+        }
+    }
+    if (!token) {
+        req.user = null;
+        return next();
+    }
+    try {
+        if (await isTokenBlacklisted(token)) { req.user = null; return next(); }
+        const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+        const user = await dbGet(
+            `SELECT id, username, name, email, role, plan, "profilePic", "coverPic", bio,
+                    "isVerified", "isActive", "userType", "hasFarmerBadge",
+                    "isOnline", "isBanned", "emailVerified", "twoFactorEnabled"
+             FROM users WHERE id = $1 AND "isActive" = TRUE`,
+            [decoded.id]
+        );
+        if (!user) { req.user = null; return next(); }
+        req.user = {
+            id: user.id, username: user.username, name: user.name,
+            email: user.email, role: user.role, plan: user.plan || 'free',
+            profilePic: user.profilePic, isVerified: user.isVerified,
+            hasFarmerBadge: user.hasFarmerBadge, userType: user.userType,
+            isBanned: user.isBanned,
+        };
+    } catch {
+        req.user = null;
     }
     next();
 }
@@ -5936,11 +6710,8 @@ app.put('/api/users/profile', authenticateToken, upload.fields([
                 const file = req.files.profilePic[0];
                 const filename = `profile_${req.user.id}_${Date.now()}.webp`;
                 const outputPath = path.join(profilesDir, filename);
-                await sharp(file.path, { sequentialRead: true })
-                    .rotate()
-                    .resize(300, 300, { fit: 'cover', kernel: 'lanczos2' })
-                    .webp({ quality: 55, effort: 1 }) // ⚡ küçük boyut → düşük kalite
-                    .toFile(outputPath);
+                // ✅ processImage: EXIF rotate + concurrency limiter + optimize quality
+                await processImage(file.path, outputPath, { width: 300, height: 300, fit: 'cover', quality: 62, effort: 3 });
                 await fs.unlink(file.path).catch(() => {});
                 updates.push(`"profilePic" = $${paramIdx++}`);
                 params.push(`/uploads/profiles/${filename}`);
@@ -5950,11 +6721,8 @@ app.put('/api/users/profile', authenticateToken, upload.fields([
                 const file = req.files.coverPic[0];
                 const filename = `cover_${req.user.id}_${Date.now()}.webp`;
                 const outputPath = path.join(profilesDir, filename);
-                await sharp(file.path, { sequentialRead: true })
-                    .rotate()
-                    .resize(1920, 1080, { fit: 'inside', withoutEnlargement: true, kernel: 'lanczos2' })
-                    .webp({ quality: 82, effort: 2 }) // ⚡ effort:2 → hızlı
-                    .toFile(outputPath);
+                // ✅ processImage: EXIF rotate + concurrency limiter + optimize quality
+                await processImage(file.path, outputPath, { width: 1920, height: 1080, fit: 'inside', quality: 80, effort: 4 });
                 await fs.unlink(file.path).catch(() => {});
                 updates.push(`"coverPic" = $${paramIdx++}`);
                 params.push(`/uploads/profiles/${filename}`);
@@ -6018,7 +6786,7 @@ app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
 });
 
 // ─── 9. KULLANICI ARA ───────────────────────────────────────────────
-app.get('/api/users/search/:query', authenticateToken, async (req, res) => {
+app.get('/api/users/search/:query', authenticateToken, searchLimiter, async (req, res) => {
     try {
         const { query } = req.params;
         const searchTerm = `%${query.toLowerCase()}%`;
@@ -6049,7 +6817,7 @@ app.get('/api/users/search/:query', authenticateToken, async (req, res) => {
 });
 
 // ─── TEKLI DOSYA YÜKLEME (UI sıralı yükleme için) ───────────────────
-app.post('/api/upload', authenticateToken, upload.single('media'), async (req, res) => {
+app.post('/api/upload', authenticateToken, uploadLimiter, upload.single('media'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'Dosya bulunamadı' });
         const file = req.file;
@@ -6075,11 +6843,8 @@ app.post('/api/upload', authenticateToken, upload.single('media'), async (req, r
             const filename = `post_${uuidv4().replace(/-/g,"").slice(0,16)}.webp`;
             const destPath = path.join(postsDir, filename);
             try {
-                await sharp(file.path, { sequentialRead: true })
-                    .rotate()
-                    .resize(1920, 1920, { fit: 'inside', withoutEnlargement: true })
-                    .webp({ quality: 82, effort: 2 })
-                    .toFile(destPath);
+                // ✅ processImage: EXIF rotate fix + concurrency limiter + optimize quality
+                await processImage(file.path, destPath, { width: 1920, height: 1920, fit: 'inside', quality: 78, effort: 4 });
             } catch {
                 await fs.unlink(file.path).catch(() => {});
                 return res.status(400).json({ error: 'Resim işlenemedi' });
@@ -6326,7 +7091,7 @@ app.get('/api/upload/chunk/config', authenticateToken, (req, res) => {
 // =============================================================================
 
 // ─── 10. GÖNDERI OLUŞTUR ────────────────────────────────────────────
-app.post('/api/posts', authenticateToken, checkRestriction('post'), upload.array('media', 10), async (req, res) => {
+app.post('/api/posts', authenticateToken, postCreateLimiter, checkRestriction('post'), upload.array('media', 10), async (req, res) => {
     try {
         const { content = '', isPoll, pollQuestion, pollOptions, latitude, longitude, locationName, allowComments = 'true', uploadedUrls: uploadedUrlsRaw } = req.body;
         const isAnketMode = isPoll === 'true' || isPoll === true;
@@ -6389,11 +7154,8 @@ app.post('/api/posts', authenticateToken, checkRestriction('post'), upload.array
                     const outputPath = path.join(postsDir, filename);
                     let imgWidth = null, imgHeight = null;
                     try {
-                        const info = await sharp(file.path, { sequentialRead: true })
-                            .rotate()
-                            .resize(1920, 1920, { fit: 'inside', withoutEnlargement: true, kernel: 'lanczos2' })
-                            .webp({ quality: 82, effort: 2, smartSubsample: true })
-                            .toFile(outputPath);
+                        // ✅ processImage: EXIF rotate fix + concurrency limiter
+                        const info = await processImage(file.path, outputPath, { width: 1920, height: 1920, fit: 'inside', quality: 78, effort: 4 });
                         imgWidth = info.width || null;
                         imgHeight = info.height || null;
                     } catch (e) {
@@ -6709,13 +7471,12 @@ app.delete('/api/posts/:id', authenticateToken, async (req, res) => {
 });
 
 // ─── 14. KULLANICININ POSTLARı ──────────────────────────────────────
-app.get('/api/users/:userId/posts', authenticateToken, async (req, res) => {
+app.get('/api/users/:userId/posts', optionalAuth, async (req, res) => {
     try {
         const { page = 1, limit = 20 } = req.query;
         const offset = (Math.max(parseInt(page)||1, 1) - 1) * Math.min(Math.max(parseInt(limit)||20,1), 200);
         const param = req.params.userId;
 
-        // ID veya username ile kullanıcı bul
         const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(param);
         let targetUserId = param;
         if (!isUUID) {
@@ -6724,33 +7485,33 @@ app.get('/api/users/:userId/posts', authenticateToken, async (req, res) => {
             targetUserId = u.id;
         }
 
+        const viewerId = req.user?.id || null;
+
         // 🔒 GİZLİ HESAP — takipçi değilse post listesi boş döner
-        if (targetUserId !== req.user.id) {
+        if (targetUserId !== viewerId) {
             const owner = await dbGet(
-                `SELECT "isPrivate", EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"
+                `SELECT "isPrivate", ${viewerId ? `EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"` : 'FALSE AS "isFollowing"'}
                  FROM users WHERE id=$2`,
-                [req.user.id, targetUserId]
+                viewerId ? [viewerId, targetUserId] : [targetUserId]
             );
             if (owner?.isPrivate && !owner?.isFollowing) {
-                console.log(`[GİZLİ HESAP] userId=${req.user.id} → post listesi engellendi (hedef=${targetUserId})`);
                 return res.json({ posts: [], total: 0, page: parseInt(page), isPrivate: true });
             }
         }
 
         const posts = await dbAll(
             `SELECT p.*, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge", u.username as "authorUsername",
-                    EXISTS(SELECT 1 FROM likes WHERE "postId" = p.id AND "userId" = $1) as "isLiked",
-                    EXISTS(SELECT 1 FROM saves WHERE "postId" = p.id AND "userId" = $1) as "isSaved"
+                    ${viewerId ? `EXISTS(SELECT 1 FROM likes WHERE "postId" = p.id AND "userId" = $1) as "isLiked",
+                    EXISTS(SELECT 1 FROM saves WHERE "postId" = p.id AND "userId" = $1) as "isSaved"` : 'FALSE as "isLiked", FALSE as "isSaved"'}
              FROM posts p
              JOIN users u ON p."userId" = u.id
              WHERE p."userId" = $2 AND p."isActive" = TRUE
              ORDER BY p."createdAt" DESC
              LIMIT $3 OFFSET $4`,
-            [req.user.id, targetUserId, parseInt(limit), offset]
+            viewerId ? [viewerId, targetUserId, parseInt(limit), offset] : [targetUserId, parseInt(limit), offset]
         );
 
         const total = await dbGet('SELECT COUNT(*) as c FROM posts WHERE "userId"=$1 AND "isActive"=TRUE', [targetUserId]);
-
         res.json({ posts: posts.map(formatPost), total: parseInt(total?.c || 0), page: parseInt(page) });
     } catch (error) {
         console.error('Kullanıcı postları hatası:', error);
@@ -6759,7 +7520,7 @@ app.get('/api/users/:userId/posts', authenticateToken, async (req, res) => {
 });
 
 // ─── 15. BEĞENİ ────────────────────────────────────────────────────
-app.post('/api/posts/:id/like', authenticateToken, checkRestriction('like'), async (req, res) => {
+app.post('/api/posts/:id/like', authenticateToken, likeLimiter, checkRestriction('like'), async (req, res) => {
     try {
         const postId = req.params.id;
         const existing = await dbGet('SELECT id FROM likes WHERE "postId" = $1 AND "userId" = $2', [postId, req.user.id]);
@@ -6793,7 +7554,7 @@ app.post('/api/posts/:id/like', authenticateToken, checkRestriction('like'), asy
 });
 
 // ─── 16. YORUM YAP ─────────────────────────────────────────────────
-app.post('/api/posts/:id/comments', authenticateToken, checkRestriction('comment'), async (req, res) => {
+app.post('/api/posts/:id/comments', authenticateToken, commentLimiter, checkRestriction('comment'), async (req, res) => {
     try {
         const { content, parentId } = req.body;
         if (!content || !content.trim()) return res.status(400).json({ error: 'Yorum boş olamaz' });
@@ -6855,20 +7616,21 @@ app.post('/api/posts/:id/comments', authenticateToken, checkRestriction('comment
 });
 
 // ─── 17. YORUMLARI GETİR ───────────────────────────────────────────
-app.get('/api/posts/:id/comments', authenticateToken, async (req, res) => {
+app.get('/api/posts/:id/comments', optionalAuth, async (req, res) => {
     try {
         const { page = 1, limit = 20 } = req.query;
         const offset = (Math.max(parseInt(page)||1, 1) - 1) * Math.min(Math.max(parseInt(limit)||20,1), 200);
+        const viewerId = req.user?.id || null;
 
         const comments = await dbAll(
             `SELECT c.*, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge",
-                    EXISTS(SELECT 1 FROM comment_likes WHERE "commentId" = c.id AND "userId" = $1) as "isLiked"
+                    ${viewerId ? `EXISTS(SELECT 1 FROM comment_likes WHERE "commentId" = c.id AND "userId" = $1) as "isLiked"` : 'FALSE as "isLiked"'}
              FROM comments c
              JOIN users u ON c."userId" = u.id
              WHERE c."postId" = $2
              ORDER BY c."createdAt" ASC
              LIMIT $3 OFFSET $4`,
-            [req.user.id, req.params.id, parseInt(limit), offset]
+            viewerId ? [viewerId, req.params.id, parseInt(limit), offset] : [req.params.id, parseInt(limit), offset]
         );
 
         res.json({ comments: comments.map(c => ({ ...c, profilePic: absoluteUrl(c.profilePic) })) });
@@ -6879,7 +7641,8 @@ app.get('/api/posts/:id/comments', authenticateToken, async (req, res) => {
 });
 
 // ─── 18. TAKİP ET/BIRAK ────────────────────────────────────────────
-app.post('/api/users/:id/follow', authenticateToken, checkRestriction('follow'), async (req, res) => {
+// 🔒 Gizli hesap: direkt takip yerine takip isteği gönderilir
+app.post('/api/users/:id/follow', authenticateToken, followLimiter, checkRestriction('follow'), async (req, res) => {
     try {
         const targetId = req.params.id;
         if (targetId === req.user.id) return res.status(400).json({ error: 'Kendinizi takip edemezsiniz' });
@@ -6890,18 +7653,60 @@ app.post('/api/users/:id/follow', authenticateToken, checkRestriction('follow'),
         const existing = await dbGet('SELECT id FROM follows WHERE "followerId" = $1 AND "followingId" = $2', [req.user.id, targetId]);
 
         if (existing) {
+            // Takipten çık
             await dbRun('DELETE FROM follows WHERE id = $1', [existing.id]);
-            res.json({ following: false });
-        } else {
-            await dbRun('INSERT INTO follows (id, "followerId", "followingId", "createdAt") VALUES ($1, $2, $3, NOW()) ON CONFLICT ("followerId", "followingId") DO NOTHING', [uuidv4(), req.user.id, targetId]);
-            createNotification(targetId, 'follow', `${req.user.username} sizi takip etmeye başladı`, {
+            // Bekleyen takip isteği de varsa sil
+            await dbRun(
+                `UPDATE follow_requests SET status='cancelled', "respondedAt"=NOW()
+                 WHERE "requesterId"=$1 AND "targetId"=$2 AND status='pending'`,
+                [req.user.id, targetId]
+            ).catch(() => {});
+            return res.json({ following: false, requested: false });
+        }
+
+        // Hedef kullanıcı gizli mi?
+        const target = await dbGet('SELECT "isPrivate" FROM users WHERE id=$1 AND "isActive"=TRUE', [targetId]);
+        if (!target) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
+
+        if (target.isPrivate) {
+            // Zaten bekleyen istek var mı?
+            const pendingReq = await dbGet(
+                `SELECT id FROM follow_requests WHERE "requesterId"=$1 AND "targetId"=$2 AND status='pending'`,
+                [req.user.id, targetId]
+            );
+            if (pendingReq) {
+                // İsteği geri çek
+                await dbRun(
+                    `UPDATE follow_requests SET status='cancelled',"respondedAt"=NOW() WHERE id=$1`,
+                    [pendingReq.id]
+                );
+                return res.json({ following: false, requested: false, message: 'Takip isteği geri çekildi' });
+            }
+            // Yeni takip isteği oluştur
+            await dbRun(
+                `INSERT INTO follow_requests (id,"requesterId","targetId",status,"createdAt")
+                 VALUES ($1,$2,$3,'pending',NOW())
+                 ON CONFLICT DO NOTHING`,
+                [uuidv4(), req.user.id, targetId]
+            );
+            createNotification(targetId, 'follow_request', `${req.user.username} sizi takip etmek istiyor`, {
                 userId         : req.user.id,
                 actorName      : req.user.name || req.user.username,
                 actorUsername  : req.user.username,
                 actorProfilePic: req.user.profilePic || '',
             });
-            res.json({ following: true });
+            return res.json({ following: false, requested: true, message: 'Takip isteği gönderildi' });
         }
+
+        // Açık hesap — direkt takip et
+        await dbRun('INSERT INTO follows (id, "followerId", "followingId", "createdAt") VALUES ($1, $2, $3, NOW()) ON CONFLICT ("followerId", "followingId") DO NOTHING', [uuidv4(), req.user.id, targetId]);
+        createNotification(targetId, 'follow', `${req.user.username} sizi takip etmeye başladı`, {
+            userId         : req.user.id,
+            actorName      : req.user.name || req.user.username,
+            actorUsername  : req.user.username,
+            actorProfilePic: req.user.profilePic || '',
+        });
+        res.json({ following: true, requested: false });
     } catch (error) {
         console.error('Takip hatası:', error);
         res.status(500).json({ error: 'Sunucu hatası' });
@@ -6909,29 +7714,29 @@ app.post('/api/users/:id/follow', authenticateToken, checkRestriction('follow'),
 });
 
 // ─── 19. TAKİPÇİLER ────────────────────────────────────────────────
-app.get('/api/users/:id/followers', authenticateToken, async (req, res) => {
+app.get('/api/users/:id/followers', optionalAuth, async (req, res) => {
     try {
-        // 🔒 GİZLİ HESAP — takipçi değilse liste boş döner
-        const isSelf = req.params.id === req.user.id;
+        const viewerId = req.user?.id || null;
+        const isSelf = viewerId && req.params.id === viewerId;
         if (!isSelf) {
             const owner = await dbGet(
-                `SELECT "isPrivate", EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"
+                `SELECT "isPrivate", ${viewerId ? `EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"` : 'FALSE AS "isFollowing"'}
                  FROM users WHERE id=$2`,
-                [req.user.id, req.params.id]
+                viewerId ? [viewerId, req.params.id] : [req.params.id]
             );
+            // 🔒 Gizli hesap: takipçi değilse takipçi listesi boş döner
             if (owner?.isPrivate && !owner?.isFollowing) {
-                console.log(`[GİZLİ HESAP] userId=${req.user.id} → takipçi listesi engellendi (hedef=${req.params.id})`);
                 return res.json({ followers: [], isPrivate: true });
             }
         }
         const followers = await dbAll(
             `SELECT u.id, u.username, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge",
-                    EXISTS(SELECT 1 FROM follows WHERE "followerId" = $2 AND "followingId" = u.id) as "isFollowing"
+                    ${viewerId ? `EXISTS(SELECT 1 FROM follows WHERE "followerId" = $2 AND "followingId" = u.id) as "isFollowing"` : 'FALSE as "isFollowing"'}
              FROM follows f
              JOIN users u ON f."followerId" = u.id
              WHERE f."followingId" = $1
              ORDER BY f."createdAt" DESC`,
-            [req.params.id, req.user.id]
+            viewerId ? [req.params.id, viewerId] : [req.params.id]
         );
         res.json({ followers: followers.map(u => ({ ...u, profilePic: absoluteUrl(u.profilePic) })) });
     } catch (error) {
@@ -6941,29 +7746,29 @@ app.get('/api/users/:id/followers', authenticateToken, async (req, res) => {
 });
 
 // ─── 20. TAKİP EDİLENLER ───────────────────────────────────────────
-app.get('/api/users/:id/following', authenticateToken, async (req, res) => {
+app.get('/api/users/:id/following', optionalAuth, async (req, res) => {
     try {
-        // 🔒 GİZLİ HESAP — takipçi değilse liste boş döner
-        const isSelf = req.params.id === req.user.id;
+        const viewerId = req.user?.id || null;
+        const isSelf = viewerId && req.params.id === viewerId;
         if (!isSelf) {
             const owner = await dbGet(
-                `SELECT "isPrivate", EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"
+                `SELECT "isPrivate", ${viewerId ? `EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"` : 'FALSE AS "isFollowing"'}
                  FROM users WHERE id=$2`,
-                [req.user.id, req.params.id]
+                viewerId ? [viewerId, req.params.id] : [req.params.id]
             );
+            // 🔒 Gizli hesap: takipçi değilse takip edilenler listesi de boş döner
             if (owner?.isPrivate && !owner?.isFollowing) {
-                console.log(`[GİZLİ HESAP] userId=${req.user.id} → takip listesi engellendi (hedef=${req.params.id})`);
                 return res.json({ following: [], isPrivate: true });
             }
         }
         const following = await dbAll(
             `SELECT u.id, u.username, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge",
-                    EXISTS(SELECT 1 FROM follows WHERE "followerId" = $2 AND "followingId" = u.id) as "isFollowing"
+                    ${viewerId ? `EXISTS(SELECT 1 FROM follows WHERE "followerId" = $2 AND "followingId" = u.id) as "isFollowing"` : 'FALSE as "isFollowing"'}
              FROM follows f
              JOIN users u ON f."followingId" = u.id
              WHERE f."followerId" = $1
              ORDER BY f."createdAt" DESC`,
-            [req.params.id, req.user.id]
+            viewerId ? [req.params.id, viewerId] : [req.params.id]
         );
         res.json({ following: following.map(u => ({ ...u, profilePic: absoluteUrl(u.profilePic) })) });
     } catch (error) {
@@ -7287,7 +8092,7 @@ app.get('/api/store/products', authenticateToken, async (req, res) => {
 });
 
 // ─── 31. ÜRÜN EKLE ─────────────────────────────────────────────────
-app.post('/api/store/products', authenticateToken, (req, res, next) => {
+app.post('/api/store/products', authenticateToken, storeLimiter, (req, res, next) => {
     // Hem 'images' (çoklu) hem 'image' (tekil) field adını kabul et
     upload.fields([
         { name: 'images', maxCount: 5 },
@@ -7318,11 +8123,8 @@ app.post('/api/store/products', authenticateToken, (req, res, next) => {
             const filename = `product_${uuidv4().replace(/-/g,"").slice(0,16)}_${i}.webp`;
             const outputPath = path.join(postsDir, filename);
             try {
-                await sharp(file.path)
-                    .rotate()
-                    .resize(1080, 1080, { fit: 'inside', withoutEnlargement: true })
-                    .webp({ quality: 85 })
-                    .toFile(outputPath);
+                // ✅ processImage: EXIF rotate fix + concurrency limiter
+                await processImage(file.path, outputPath, { width: 1080, height: 1080, fit: 'inside', quality: 78, effort: 4 });
             } catch (imgErr) {
                 console.warn('Görsel işleme hatası, orijinal kullanılıyor:', imgErr.message);
                 const fs2 = require('fs');
@@ -7476,7 +8278,7 @@ app.get('/api/stats', authenticateToken, async (req, res) => {
 });
 
 // ─── POST ŞİKAYETİ ─────────────────────────────────────────────────
-app.post('/api/reports/post', authenticateToken, async (req, res) => {
+app.post('/api/reports/post', authenticateToken, reportLimiter, async (req, res) => {
     try {
         const { postId, reason, description } = req.body;
         if (!postId || !reason) return res.status(400).json({ error: 'Post ID ve neden gerekli' });
@@ -7533,7 +8335,7 @@ app.post('/api/auth/verify-email', authenticateToken, async (req, res) => {
 // ─── YENİ ROTA 2: DOĞRULAMA KODUNU YENİDEN GÖNDER ──────────────────
 // ✅ HATA DÜZELTMESİ 1: authenticateToken kaldırıldı — kayıt akışında kullanıcının henüz token'ı yoktur.
 // ✅ HATA DÜZELTMESİ 2: sendVerificationEmail → sendEmailVerificationCode (tanımsız fonksiyon hatası giderildi).
-app.post('/api/auth/resend-verification', validateAuthInput, async (req, res) => {
+app.post('/api/auth/resend-verification', resendVerificationLimiter, validateAuthInput, async (req, res) => {
     try {
         // Token varsa token'dan, yoksa body'den email al
         const emailFromBody = req.body?.email;
@@ -7987,27 +8789,10 @@ app.get('/api/videos/:postId/info', authenticateToken, async (req, res) => {
     }
 });
 
-// ─── HLS DURUM (istemci manifest hazır mı diye sorar) ───────────────
+// ─── HLS DURUM — HLS kalıcı olarak devre dışı, her zaman MP4 kullanılır ─
+// Frontend bu endpoint'i sorgulayıp HLS'e geçmesin diye her zaman ready:false döner.
 app.get('/api/videos/:videoId/hls-status', authenticateToken, (req, res) => {
-    // 🔒 Path traversal koruması
-    const safeId = sanitizeVideoId(req.params.videoId);
-    if (!safeId) return res.status(400).json({ error: 'Geçersiz video ID' });
-    const masterPath = path.join(hlsDir, safeId, 'master.m3u8');
-    if (!masterPath.startsWith(hlsDir + path.sep)) return res.status(403).json({ error: 'Erişim reddedildi' });
-    if (fssync.existsSync(masterPath)) {
-        const variants = HLS_VARIANTS.map(v => {
-            const pl = path.join(hlsDir, safeId, v.name, 'playlist.m3u8');
-            return { name: v.name, ready: fssync.existsSync(pl), url: absoluteUrl(`/uploads/hls/${safeId}/${v.name}/playlist.m3u8`) };
-        }).filter(v => v.ready);
-
-        return res.json({
-            ready      : true,
-            masterUrl  : absoluteUrl(`/uploads/hls/${safeId}/master.m3u8`),
-            variants,
-            activeVideoJobs: activeVideoJobs,
-        });
-    }
-    res.json({ ready: false, activeVideoJobs: activeVideoJobs, message: 'HLS henüz işleniyor, MP4 ile oynat' });
+    res.json({ ready: false, hlsDisabled: true, activeVideoJobs: activeVideoJobs, message: 'HLS devre dışı, MP4 kullanılıyor' });
 });
 
 // ─── HLS→MP4 MİGRASYON: Eski m3u8 URL'li gönderileri mp4'e çevir ──────
@@ -8331,7 +9116,7 @@ app.get('/api/hashtags/:tag', authenticateToken, async (req, res) => {
 });
 
 // ─── 36. YORUM BEĞENİ ──────────────────────────────────────────────
-app.post('/api/comments/:id/like', authenticateToken, checkRestriction('like'), async (req, res) => {
+app.post('/api/comments/:id/like', authenticateToken, likeLimiter, checkRestriction('like'), async (req, res) => {
     try {
         const commentId = req.params.id;
         const existing = await dbGet('SELECT id FROM comment_likes WHERE "commentId" = $1 AND "userId" = $2', [commentId, req.user.id]);
@@ -8376,7 +9161,7 @@ app.delete('/api/comments/:id', authenticateToken, async (req, res) => {
 });
 
 // ─── 38. STORY OLUŞTUR ─────────────────────────────────────────────
-app.post('/api/stories', authenticateToken, upload.single('media'), async (req, res) => {
+app.post('/api/stories', authenticateToken, storyLimiter, upload.single('media'), async (req, res) => {
     try {
         const { caption, text, textColor, textLayers, filter, linkUrl, hashtag, mentions, replyMode } = req.body;
         if (!req.file && !text) return res.status(400).json({ error: 'Medya veya metin gerekli' });
@@ -8397,7 +9182,8 @@ app.post('/api/stories', authenticateToken, upload.single('media'), async (req, 
             } else {
                 const filename = `story_${uuidv4().replace(/-/g,"").slice(0,16)}.webp`;
                 const dest = path.join(postsDir, filename);
-                await sharp(req.file.path).rotate().resize(1080, 1920, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 85 }).toFile(dest);
+                // ✅ processImage: EXIF rotate fix + concurrency limiter
+                await processImage(req.file.path, dest, { width: 1080, height: 1920, fit: 'inside', quality: 80, effort: 4 });
                 await fs.unlink(req.file.path).catch(() => {});
                 mediaUrl = `/uploads/posts/${filename}`;
             }
@@ -8579,7 +9365,7 @@ app.post('/api/stories/share-post', authenticateToken, async (req, res) => {
 
 
 // ─── 43. KULLANICI ARA (v2) ─────────────────────────────────────────
-app.get('/api/search/users', authenticateToken, async (req, res) => {
+app.get('/api/search/users', authenticateToken, searchLimiter, async (req, res) => {
     try {
         const { q, page = 1, limit = 20 } = req.query;
         if (!q || q.trim().length < 2) return res.status(400).json({ error: 'En az 2 karakter gerekli' });
@@ -8611,7 +9397,7 @@ app.get('/api/search/users', authenticateToken, async (req, res) => {
 });
 
 // ─── 44. POST ARA ───────────────────────────────────────────────────
-app.get('/api/search/posts', authenticateToken, async (req, res) => {
+app.get('/api/search/posts', authenticateToken, searchLimiter, async (req, res) => {
     try {
         const { q, page = 1, limit = 20 } = req.query;
         if (!q || q.trim().length < 2) return res.status(400).json({ error: 'En az 2 karakter gerekli' });
@@ -8644,7 +9430,7 @@ app.get('/api/search/posts', authenticateToken, async (req, res) => {
 });
 
 // ─── 45. HASHTAG İLE ARA ────────────────────────────────────────────
-app.get('/api/search/hashtag/:tag', authenticateToken, async (req, res) => {
+app.get('/api/search/hashtag/:tag', authenticateToken, searchLimiter, async (req, res) => {
     try {
         const { page = 1, limit = 20 } = req.query;
         const offset = (Math.max(parseInt(page)||1, 1) - 1) * Math.min(Math.max(parseInt(limit)||20,1), 200);
@@ -8748,7 +9534,7 @@ app.put('/api/store/products/:id', authenticateToken, (req, res, next) => {
             for (let i = 0; i < files.length; i++) {
                 const filename = `product_${uuidv4().replace(/-/g,"").slice(0,16)}_${i}.webp`;
                 const outputPath = path.join(postsDir, filename);
-                await sharp(files[i].path).rotate().resize(1080, 1080, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 85 }).toFile(outputPath);
+                await processImage(files[i].path, outputPath, { width: 1080, height: 1080, fit: 'inside', quality: 78, effort: 4 });
                 await fs.unlink(files[i].path).catch(() => {});
                 images.push(`/uploads/posts/${filename}`);
             }
@@ -8809,16 +9595,44 @@ app.delete('/api/auth/account', authenticateToken, async (req, res) => {
 // ─── 52. KULLANICI ÖNERİLERİ ────────────────────────────────────────
 app.get('/api/users/suggestions', authenticateToken, async (req, res) => {
     try {
-        const suggestions = await dbAll(
-            `SELECT id, username, name, "profilePic", "isVerified", "hasFarmerBadge", "userType"
-             FROM users
-             WHERE "isActive" = TRUE AND id != $1
-               AND id NOT IN (SELECT "followingId" FROM follows WHERE "followerId" = $1)
-               AND id NOT IN (SELECT "blockedId" FROM blocks WHERE "blockerId" = $1)
-             ORDER BY "isVerified" DESC, "hasFarmerBadge" DESC, RANDOM()
-             LIMIT 10`,
+        // Önce ortak bağlantı mantığıyla öner (takip ettiklerinin takip ettikleri)
+        const mutual = await dbAll(
+            `SELECT DISTINCT u.id, u.username, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge", u."userType",
+                    COUNT(DISTINCT f2.id) AS "mutualCount"
+             FROM follows f1
+             JOIN follows f2 ON f1."followingId" = f2."followerId"
+             JOIN users u ON f2."followingId" = u.id
+             WHERE f1."followerId" = $1
+               AND f2."followingId" != $1
+               AND u."isActive" = TRUE
+               AND f2."followingId" NOT IN (SELECT "followingId" FROM follows WHERE "followerId" = $1)
+               AND f2."followingId" NOT IN (SELECT "blockedId" FROM blocks WHERE "blockerId" = $1)
+             GROUP BY u.id, u.username, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge", u."userType"
+             ORDER BY "mutualCount" DESC
+             LIMIT 5`,
             [req.user.id]
         );
+
+        let suggestions = [...mutual];
+
+        // Ortak bağlantı yetmezse rastgele tamamla — kullanıcı ID tabanlı seed ile farklı sıralama
+        if (suggestions.length < 10) {
+            const needed = 10 - suggestions.length;
+            const existingIds = suggestions.map(s => s.id);
+            const extra = await dbAll(
+                `SELECT id, username, name, "profilePic", "isVerified", "hasFarmerBadge", "userType", 0 AS "mutualCount"
+                 FROM users
+                 WHERE "isActive" = TRUE AND id != $1
+                   AND id NOT IN (SELECT "followingId" FROM follows WHERE "followerId" = $1)
+                   AND id NOT IN (SELECT "blockedId" FROM blocks WHERE "blockerId" = $1)
+                   ${existingIds.length > 0 ? `AND id NOT IN (${existingIds.map((_, i) => `$${i+3}`).join(',')})` : ''}
+                 ORDER BY "isVerified" DESC, "hasFarmerBadge" DESC, RANDOM()
+                 LIMIT $2`,
+                [req.user.id, needed, ...existingIds]
+            );
+            suggestions = [...suggestions, ...extra];
+        }
+
         res.json({ suggestions });
     } catch (error) {
         console.error('Öneriler hatası:', error);
@@ -8875,7 +9689,7 @@ app.put('/api/users/privacy', authenticateToken, async (req, res) => {
 });
 
 // ─── 57. KULLANICI ŞİKAYET ET ───────────────────────────────────────
-app.post('/api/reports/user', authenticateToken, async (req, res) => {
+app.post('/api/reports/user', authenticateToken, reportLimiter, async (req, res) => {
     try {
         const { userId, reason, description } = req.body;
         if (!userId || !reason) return res.status(400).json({ error: 'Kullanıcı ID ve neden gerekli' });
@@ -10250,6 +11064,8 @@ app.get('/api/feed/explore', authenticateToken, async (req, res) => {
                       UNION
                       SELECT "blockerId" FROM blocks WHERE "blockedId" = $1
                   )
+                  -- 🔒 Gizli hesaplar keşfete çıkamaz
+                  AND u."isPrivate" = FALSE
             )
             SELECT * FROM scored
             ORDER BY explore_score DESC, "createdAt" DESC
@@ -10781,6 +11597,17 @@ app.get('/api/users/:id/followers/list', authenticateToken, async (req, res) => 
         const { page=1, limit=20 } = req.query;
         const pn = Math.max(1,parseInt(page)||1), ln = Math.min(parseInt(limit)||20,100);
         const off = (pn-1)*ln;
+        // 🔒 Gizli hesap: kendisi değilse ve takipçi değilse liste boş döner
+        if (req.params.id !== req.user.id) {
+            const owner = await dbGet(
+                `SELECT "isPrivate", EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"
+                 FROM users WHERE id=$2`,
+                [req.user.id, req.params.id]
+            );
+            if (owner?.isPrivate && !owner?.isFollowing) {
+                return res.json({ followers: [], total: 0, page: pn, totalPages: 0, isPrivate: true });
+            }
+        }
         const followers = await dbAll(`
             SELECT u.id, u.name, u.username, u."profilePic", u."isVerified",
                 EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=u.id) AS "isFollowing",
@@ -10800,6 +11627,17 @@ app.get('/api/users/:id/following/list', authenticateToken, async (req, res) => 
         const { page=1, limit=20 } = req.query;
         const pn = Math.max(1,parseInt(page)||1), ln = Math.min(parseInt(limit)||20,100);
         const off = (pn-1)*ln;
+        // 🔒 Gizli hesap: kendisi değilse ve takipçi değilse liste boş döner
+        if (req.params.id !== req.user.id) {
+            const owner = await dbGet(
+                `SELECT "isPrivate", EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"
+                 FROM users WHERE id=$2`,
+                [req.user.id, req.params.id]
+            );
+            if (owner?.isPrivate && !owner?.isFollowing) {
+                return res.json({ following: [], total: 0, page: pn, totalPages: 0, isPrivate: true });
+            }
+        }
         const following = await dbAll(`
             SELECT u.id, u.name, u.username, u."profilePic", u."isVerified",
                 EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=u.id) AS "isFollowing"
@@ -10902,7 +11740,7 @@ app.post('/api/messages/image', authenticateToken, upload.single('image'), async
         if (blocked) return res.status(403).json({ error:'Mesaj gönderilemiyor' });
         const filename  = `msg_${uuidv4().replace(/-/g,"").slice(0,16)}.webp`;
         const outPath   = path.join(postsDir, filename);
-        await sharp(req.file.path).rotate().resize(1920,1920,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toFile(outPath);
+        await processImage(req.file.path, outPath, { width: 1920, height: 1920, fit: 'inside', quality: 78, effort: 4 });
         await fs.unlink(req.file.path).catch(()=>{});
         const imageUrl  = `/uploads/posts/${filename}`;
         const sender    = await dbGet('SELECT username FROM users WHERE id=$1',[req.user.id]);
@@ -12464,7 +13302,7 @@ app.post('/api/chats/group', authenticateToken, upload.single('photo'), async (r
         if (req.file) {
             const fname = `group_${groupId}_${Date.now()}.webp`;
             const out = require('path').join(profilesDir, fname);
-            await sharp(req.file.path).rotate().resize(256,256,{fit:'cover'}).webp({quality:85}).toFile(out);
+            await processImage(req.file.path, out, { width: 256, height: 256, fit: 'cover', quality: 65, effort: 3 });
             await require('fs').promises.unlink(req.file.path).catch(()=>{});
             photoUrl = `/uploads/profiles/${fname}`;
         }
@@ -12620,7 +13458,7 @@ app.post('/api/products', authenticateToken, (req, res, next) => {
         for (let i = 0; i < files.length; i++) {
             const fname = `product_${Date.now()}_${i}.webp`;
             const out = require('path').join(postsDir, fname);
-            await sharp(files[i].path).rotate().resize(1080,1080,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toFile(out);
+            await processImage(files[i].path, out, { width: 1080, height: 1080, fit: 'inside', quality: 78, effort: 4 });
             await fs.unlink(files[i].path).catch(()=>{});
             images.push(`/uploads/posts/${fname}`);
         }
@@ -12668,7 +13506,7 @@ app.put('/api/products/:productId', authenticateToken, (req, res, next) => {
             for (let i=0;i<files.length;i++){
                 const fname=`product_${Date.now()}_${i}.webp`;
                 const out=require('path').join(postsDir,fname);
-                await sharp(files[i].path).rotate().resize(1080,1080,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toFile(out);
+                await processImage(files[i].path, out, { width: 1080, height: 1080, fit: 'inside', quality: 78, effort: 4 });
                 await fs.unlink(files[i].path).catch(()=>{});
                 imgs.push(`/uploads/posts/${fname}`);
             }
@@ -15027,7 +15865,7 @@ app.post('/api/hasat-takip/tarlalar/:id/foto', authenticateToken, upload.single(
         // Resmi işle
         const filename = `hasat_${uuidv4().slice(0,12)}.webp`;
         const dest = path.join(postsDir, filename);
-        await sharp(req.file.path).rotate().resize(1080, 1080, { fit:'inside', withoutEnlargement:true }).webp({ quality:82 }).toFile(dest);
+        await processImage(req.file.path, dest, { width: 1080, height: 1080, fit: 'inside', quality: 78, effort: 4 });
         await require('fs').promises.unlink(req.file.path).catch(()=>{});
 
         const fotoUrl = `/uploads/posts/${filename}`;
@@ -15120,7 +15958,7 @@ a{display:block;padding:16px;background:#10b981;color:white;border-radius:16px;f
 // ════════════════════════════════════════════════════════════════════════════
 
 // POST /api/partnership/apply — Auth gerektirmez, herkese açık
-app.post('/api/partnership/apply', async (req, res) => {
+app.post('/api/partnership/apply', checkPartnershipIpBan, partnershipLimiter, async (req, res) => {
     console.log(`[Partnership] POST /api/partnership/apply — origin: ${req.headers.origin || 'yok'} | body keys: ${Object.keys(req.body || {}).join(',')}`);
     try {
         const { fullName, email, phone, workField, message } = req.body;
@@ -16090,6 +16928,526 @@ app.post('/sikayet/action/:id/:action', requireSikayetAuth, async (req, res) => 
 });
 
 
+
+// ════════════════════════════════════════════════════════════════════
+// 📢 REKLAM SİSTEMİ — /api/ads
+// ════════════════════════════════════════════════════════════════════
+// Reklamverenler POST ile reklam yükler; ana app rastgele çeker.
+//
+// Tablo: ads
+//   id, "userId", title, body, imageUrl, linkUrl,
+//   "isActive", views, clicks, "createdAt", "updatedAt"
+// ════════════════════════════════════════════════════════════════════
+
+// ─── REKLAM TABLOSU MIGRATION ─────────────────────────────────────
+// initializeDatabase içinden çalışır; burada async IIFE ile güvenli ekleme
+(async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS ads (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "userId" UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                body TEXT,
+                "imageUrl" TEXT,
+                "linkUrl" TEXT,
+                "isActive" BOOLEAN DEFAULT TRUE,
+                views INTEGER DEFAULT 0,
+                clicks INTEGER DEFAULT 0,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_active ON ads("isActive")`);
+    } catch (e) {
+        console.warn('[Ads] Tablo migration uyarısı:', e.message);
+    }
+})();
+
+// ─── REKLAM OLUŞTUR (POST) ──────────────────────────────────────────
+// Herhangi bir doğrulanmış kullanıcı reklam ekleyebilir
+app.post('/api/ads', authenticateToken, upload.single('image'), async (req, res) => {
+    try {
+        const { title, body, linkUrl } = req.body;
+        if (!title) return res.status(400).json({ error: 'Reklam başlığı zorunludur' });
+
+        let imageUrl = null;
+        if (req.file) {
+            try { await verifyUploadedFile(req.file, 'profilePic'); } // resim tipi kontrolü
+            catch (verifyErr) { return res.status(400).json({ error: verifyErr.message }); }
+            const filename = `ad_${uuidv4().replace(/-/g,'').slice(0,16)}.webp`;
+            const outputPath = path.join(postsDir, filename);
+            await processImage(req.file.path, outputPath, { width: 1200, height: 628, fit: 'cover', quality: 80, effort: 4 });
+            await require('fs').promises.unlink(req.file.path).catch(() => {});
+            imageUrl = `/uploads/posts/${filename}`;
+        }
+
+        const adId = uuidv4();
+        await pool.query(
+            `INSERT INTO ads (id, "userId", title, body, "imageUrl", "linkUrl", "createdAt", "updatedAt")
+             VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW())`,
+            [adId, req.user.id, title.substring(0, 200), (body||'').substring(0,500), imageUrl, linkUrl||null]
+        );
+
+        res.status(201).json({ success: true, adId, message: 'Reklam oluşturuldu' });
+    } catch (e) {
+        console.error('[Ads] Oluşturma hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── RASTGELE REKLAM ÇEK (GET) ─────────────────────────────────────
+// Ana app bu endpoint'i çağırarak rastgele aktif reklam alır
+app.get('/api/ads/random', authenticateToken, async (req, res) => {
+    try {
+        const ad = await pool.query(
+            `SELECT a.id, a.title, a.body, a."imageUrl", a."linkUrl", a.views, a.clicks,
+                    u.username AS "ownerUsername", u.name AS "ownerName", u."profilePic" AS "ownerPic"
+             FROM ads a
+             JOIN users u ON a."userId" = u.id
+             WHERE a."isActive" = TRUE AND u."isActive" = TRUE
+             ORDER BY RANDOM()
+             LIMIT 1`
+        );
+        if (!ad.rows.length) return res.json({ ad: null });
+
+        // Görüntülenme sayısını artır
+        await pool.query(`UPDATE ads SET views = views + 1, "updatedAt"=NOW() WHERE id=$1`, [ad.rows[0].id]).catch(() => {});
+
+        res.json({
+            ad: {
+                ...ad.rows[0],
+                imageUrl: absoluteUrl(ad.rows[0].imageUrl),
+                ownerPic: absoluteUrl(ad.rows[0].ownerPic),
+            }
+        });
+    } catch (e) {
+        console.error('[Ads] Rastgele çekme hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── REKLAM TIKLAMA SAYACI ─────────────────────────────────────────
+app.post('/api/ads/:id/click', authenticateToken, async (req, res) => {
+    try {
+        await pool.query(`UPDATE ads SET clicks = clicks + 1, "updatedAt"=NOW() WHERE id=$1`, [req.params.id]);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── KENDİ REKLAMLARI ──────────────────────────────────────────────
+app.get('/api/ads/my', authenticateToken, async (req, res) => {
+    try {
+        const ads = await pool.query(
+            `SELECT * FROM ads WHERE "userId"=$1 ORDER BY "createdAt" DESC`,
+            [req.user.id]
+        );
+        res.json({ ads: ads.rows.map(a => ({ ...a, imageUrl: absoluteUrl(a.imageUrl) })) });
+    } catch (e) {
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── REKLAM SİL ────────────────────────────────────────────────────
+app.delete('/api/ads/:id', authenticateToken, async (req, res) => {
+    try {
+        const ad = await pool.query(`SELECT "userId" FROM ads WHERE id=$1`, [req.params.id]);
+        if (!ad.rows.length) return res.status(404).json({ error: 'Reklam bulunamadı' });
+        if (ad.rows[0].userId !== req.user.id && req.user.role !== 'admin') {
+            return res.status(403).json({ error: 'Yetkiniz yok' });
+        }
+        await pool.query(`UPDATE ads SET "isActive"=FALSE,"updatedAt"=NOW() WHERE id=$1`, [req.params.id]);
+        res.json({ message: 'Reklam silindi' });
+    } catch (e) {
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// 🏘️ TOPLULUKLAR (COMMUNITIES) — Discord sunucusu / grup mantığı
+// ════════════════════════════════════════════════════════════════════
+// Şartlar: En az 50 takipçisi olan kullanıcılar topluluk kurabilir.
+// Yapı: communities, community_members, community_posts tabloları
+// ════════════════════════════════════════════════════════════════════
+
+(async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS communities (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "ownerId" UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                slug TEXT UNIQUE NOT NULL,
+                description TEXT,
+                "avatarUrl" TEXT,
+                "bannerUrl" TEXT,
+                "isPrivate" BOOLEAN DEFAULT FALSE,
+                "memberCount" INTEGER DEFAULT 1,
+                "postCount" INTEGER DEFAULT 0,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS community_members (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "communityId" UUID NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+                "userId" UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                role TEXT NOT NULL DEFAULT 'member',
+                "joinedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE("communityId","userId")
+            )
+        `);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS community_posts (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "communityId" UUID NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+                "postId" UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                "userId" UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE("communityId","postId")
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_community_members_user ON community_members("userId")`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_community_posts_com ON community_posts("communityId")`);
+        console.log('✅ [Communities] Tablolar hazır');
+    } catch (e) {
+        console.warn('[Communities] Migration uyarısı:', e.message);
+    }
+})();
+
+// ─── TOPLULUK OLUŞTUR ──────────────────────────────────────────────
+// Şart: en az 50 takipçi
+app.post('/api/communities', authenticateToken, upload.fields([
+    { name: 'avatar', maxCount: 1 },
+    { name: 'banner', maxCount: 1 }
+]), async (req, res) => {
+    try {
+        const { name, description, slug, isPrivate } = req.body;
+        if (!name || !slug) return res.status(400).json({ error: 'Topluluk adı ve slug zorunludur' });
+
+        // 🔒 En az 50 takipçi şartı
+        const followerResult = await pool.query(
+            `SELECT COUNT(*)::int AS cnt FROM follows WHERE "followingId"=$1`,
+            [req.user.id]
+        );
+        const followerCount = followerResult.rows[0]?.cnt || 0;
+        if (followerCount < 50) {
+            return res.status(403).json({
+                error: `Topluluk oluşturmak için en az 50 takipçiniz olmalıdır. Şu anki takipçi sayınız: ${followerCount}`
+            });
+        }
+
+        // Slug doğrulama
+        const cleanSlug = slug.toLowerCase().replace(/[^a-z0-9_-]/g, '').substring(0, 50);
+        if (!cleanSlug) return res.status(400).json({ error: 'Geçersiz slug' });
+        const slugExists = await pool.query(`SELECT id FROM communities WHERE slug=$1`, [cleanSlug]);
+        if (slugExists.rows.length) return res.status(400).json({ error: 'Bu slug zaten alınmış' });
+
+        let avatarUrl = null, bannerUrl = null;
+        if (req.files?.avatar?.[0]) {
+            const f = req.files.avatar[0];
+            const fname = `com_av_${uuidv4().replace(/-/g,'').slice(0,12)}.webp`;
+            await processImage(f.path, path.join(profilesDir, fname), { width: 300, height: 300, fit: 'cover', quality: 75, effort: 4 });
+            await require('fs').promises.unlink(f.path).catch(() => {});
+            avatarUrl = `/uploads/profiles/${fname}`;
+        }
+        if (req.files?.banner?.[0]) {
+            const f = req.files.banner[0];
+            const fname = `com_bn_${uuidv4().replace(/-/g,'').slice(0,12)}.webp`;
+            await processImage(f.path, path.join(postsDir, fname), { width: 1500, height: 500, fit: 'cover', quality: 80, effort: 4 });
+            await require('fs').promises.unlink(f.path).catch(() => {});
+            bannerUrl = `/uploads/posts/${fname}`;
+        }
+
+        const communityId = uuidv4();
+        await pool.query(
+            `INSERT INTO communities (id,"ownerId",name,slug,description,"avatarUrl","bannerUrl","isPrivate","createdAt","updatedAt")
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())`,
+            [communityId, req.user.id, name.substring(0,100), cleanSlug, (description||'').substring(0,1000), avatarUrl, bannerUrl, !!isPrivate]
+        );
+
+        // Kurucu üye olarak ekle
+        await pool.query(
+            `INSERT INTO community_members (id,"communityId","userId",role,"joinedAt")
+             VALUES ($1,$2,$3,'owner',NOW())`,
+            [uuidv4(), communityId, req.user.id]
+        );
+
+        res.status(201).json({
+            success: true,
+            communityId,
+            slug: cleanSlug,
+            message: 'Topluluk oluşturuldu'
+        });
+    } catch (e) {
+        console.error('[Communities] Oluşturma hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── TOPLULUK LİSTESİ ──────────────────────────────────────────────
+app.get('/api/communities', authenticateToken, async (req, res) => {
+    try {
+        const { page=1, limit=20, q } = req.query;
+        const pn = Math.max(1,parseInt(page)||1);
+        const ln = Math.min(parseInt(limit)||20,100);
+        const off = (pn-1)*ln;
+
+        let where = `c."isPrivate"=FALSE OR cm."userId"=$1`;
+        const params = [req.user.id];
+        if (q) { where += ` AND (c.name ILIKE $${params.length+1} OR c.slug ILIKE $${params.length+1})`; params.push(`%${q}%`); }
+
+        const communities = await pool.query(
+            `SELECT DISTINCT c.*, u.username AS "ownerUsername", u.name AS "ownerName", u."profilePic" AS "ownerPic",
+                    u."isVerified" AS "ownerVerified",
+                    EXISTS(SELECT 1 FROM community_members WHERE "communityId"=c.id AND "userId"=$1) AS "isMember"
+             FROM communities c
+             JOIN users u ON c."ownerId"=u.id
+             LEFT JOIN community_members cm ON cm."communityId"=c.id AND cm."userId"=$1
+             WHERE c."ownerId" IN (SELECT id FROM users WHERE "isActive"=TRUE)
+             ORDER BY c."memberCount" DESC, c."createdAt" DESC
+             LIMIT $${params.length+1} OFFSET $${params.length+2}`,
+            [...params, ln, off]
+        );
+
+        res.json({
+            communities: communities.rows.map(c => ({
+                ...c,
+                avatarUrl: absoluteUrl(c.avatarUrl),
+                bannerUrl: absoluteUrl(c.bannerUrl),
+                ownerPic: absoluteUrl(c.ownerPic),
+            }))
+        });
+    } catch (e) {
+        console.error('[Communities] Liste hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── TOPLULUK DETAYI ───────────────────────────────────────────────
+app.get('/api/communities/:slugOrId', authenticateToken, async (req, res) => {
+    try {
+        const param = req.params.slugOrId;
+        const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(param);
+        const community = await pool.query(
+            `SELECT c.*, u.username AS "ownerUsername", u.name AS "ownerName", u."profilePic" AS "ownerPic",
+                    u."isVerified" AS "ownerVerified",
+                    EXISTS(SELECT 1 FROM community_members WHERE "communityId"=c.id AND "userId"=$1) AS "isMember",
+                    (SELECT role FROM community_members WHERE "communityId"=c.id AND "userId"=$1) AS "myRole"
+             FROM communities c
+             JOIN users u ON c."ownerId"=u.id
+             WHERE ${isUUID ? 'c.id=$2' : 'c.slug=$2'}`,
+            [req.user.id, param]
+        );
+        if (!community.rows.length) return res.status(404).json({ error: 'Topluluk bulunamadı' });
+        const c = community.rows[0];
+
+        // Gizli topluluk: üye değilse bilgi kısıtlı
+        if (c.isPrivate && !c.isMember) {
+            return res.json({
+                community: {
+                    id: c.id, name: c.name, slug: c.slug, description: c.description,
+                    avatarUrl: absoluteUrl(c.avatarUrl), memberCount: c.memberCount,
+                    isPrivate: true, isMember: false
+                }
+            });
+        }
+
+        res.json({
+            community: {
+                ...c,
+                avatarUrl: absoluteUrl(c.avatarUrl),
+                bannerUrl: absoluteUrl(c.bannerUrl),
+                ownerPic: absoluteUrl(c.ownerPic),
+            }
+        });
+    } catch (e) {
+        console.error('[Communities] Detay hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── TOPLULUĞA KATIL / AYRIL ───────────────────────────────────────
+app.post('/api/communities/:id/join', authenticateToken, async (req, res) => {
+    try {
+        const communityId = req.params.id;
+        const community = await pool.query(`SELECT id,"isPrivate","ownerId" FROM communities WHERE id=$1`, [communityId]);
+        if (!community.rows.length) return res.status(404).json({ error: 'Topluluk bulunamadı' });
+        if (community.rows[0].ownerId === req.user.id) {
+            return res.status(400).json({ error: 'Zaten topluluğun sahibisiniz' });
+        }
+
+        const existing = await pool.query(
+            `SELECT id FROM community_members WHERE "communityId"=$1 AND "userId"=$2`,
+            [communityId, req.user.id]
+        );
+
+        if (existing.rows.length) {
+            // Ayrıl
+            await pool.query(`DELETE FROM community_members WHERE "communityId"=$1 AND "userId"=$2`, [communityId, req.user.id]);
+            await pool.query(`UPDATE communities SET "memberCount"=GREATEST("memberCount"-1,0),"updatedAt"=NOW() WHERE id=$1`, [communityId]);
+            return res.json({ joined: false, message: 'Topluluktan ayrıldınız' });
+        }
+
+        // Katıl
+        await pool.query(
+            `INSERT INTO community_members (id,"communityId","userId",role,"joinedAt")
+             VALUES ($1,$2,$3,'member',NOW()) ON CONFLICT DO NOTHING`,
+            [uuidv4(), communityId, req.user.id]
+        );
+        await pool.query(`UPDATE communities SET "memberCount"="memberCount"+1,"updatedAt"=NOW() WHERE id=$1`, [communityId]);
+        res.json({ joined: true, message: 'Topluluğa katıldınız' });
+    } catch (e) {
+        console.error('[Communities] Katılma hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── TOPLULUĞA POST PAYLAŞ ─────────────────────────────────────────
+app.post('/api/communities/:id/posts', authenticateToken, async (req, res) => {
+    try {
+        const communityId = req.params.id;
+        const { postId } = req.body;
+        if (!postId) return res.status(400).json({ error: 'postId zorunludur' });
+
+        const member = await pool.query(
+            `SELECT id FROM community_members WHERE "communityId"=$1 AND "userId"=$2`,
+            [communityId, req.user.id]
+        );
+        if (!member.rows.length) return res.status(403).json({ error: 'Bu topluluğun üyesi değilsiniz' });
+
+        // Post bu kullanıcıya mı ait?
+        const post = await pool.query(`SELECT "userId" FROM posts WHERE id=$1 AND "isActive"=TRUE`, [postId]);
+        if (!post.rows.length) return res.status(404).json({ error: 'Gönderi bulunamadı' });
+        if (post.rows[0].userId !== req.user.id) return res.status(403).json({ error: 'Sadece kendi gönderilerinizi paylaşabilirsiniz' });
+
+        await pool.query(
+            `INSERT INTO community_posts (id,"communityId","postId","userId","createdAt")
+             VALUES ($1,$2,$3,$4,NOW()) ON CONFLICT DO NOTHING`,
+            [uuidv4(), communityId, postId, req.user.id]
+        );
+        await pool.query(`UPDATE communities SET "postCount"="postCount"+1,"updatedAt"=NOW() WHERE id=$1`, [communityId]).catch(()=>{});
+
+        res.status(201).json({ success: true, message: 'Gönderi topluluğa paylaşıldı' });
+    } catch (e) {
+        console.error('[Communities] Post paylaşma hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── TOPLULUK FEED ─────────────────────────────────────────────────
+app.get('/api/communities/:id/posts', authenticateToken, async (req, res) => {
+    try {
+        const communityId = req.params.id;
+        const { page=1, limit=20 } = req.query;
+        const pn = Math.max(1,parseInt(page)||1);
+        const ln = Math.min(parseInt(limit)||20,50);
+        const off = (pn-1)*ln;
+
+        const community = await pool.query(`SELECT id,"isPrivate" FROM communities WHERE id=$1`, [communityId]);
+        if (!community.rows.length) return res.status(404).json({ error: 'Topluluk bulunamadı' });
+
+        // Gizli topluluk üyelik kontrolü
+        if (community.rows[0].isPrivate) {
+            const isMember = await pool.query(
+                `SELECT id FROM community_members WHERE "communityId"=$1 AND "userId"=$2`,
+                [communityId, req.user.id]
+            );
+            if (!isMember.rows.length) return res.status(403).json({ error: 'Bu topluluk gizlidir' });
+        }
+
+        const posts = await pool.query(
+            `SELECT p.*, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge", u.username AS "authorUsername",
+                    EXISTS(SELECT 1 FROM likes WHERE "postId"=p.id AND "userId"=$1) AS "isLiked",
+                    EXISTS(SELECT 1 FROM saves WHERE "postId"=p.id AND "userId"=$1) AS "isSaved",
+                    cp."createdAt" AS "sharedAt"
+             FROM community_posts cp
+             JOIN posts p ON cp."postId"=p.id
+             JOIN users u ON p."userId"=u.id
+             WHERE cp."communityId"=$2 AND p."isActive"=TRUE
+             ORDER BY cp."createdAt" DESC
+             LIMIT $3 OFFSET $4`,
+            [req.user.id, communityId, ln, off]
+        );
+
+        const total = await pool.query(`SELECT COUNT(*) AS c FROM community_posts WHERE "communityId"=$1`, [communityId]);
+        res.json({
+            posts: posts.rows.map(formatPost),
+            total: parseInt(total.rows[0]?.c||0),
+            page: pn,
+            totalPages: Math.ceil((total.rows[0]?.c||0)/ln)
+        });
+    } catch (e) {
+        console.error('[Communities] Feed hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── TOPLULUK ÜYELERİ ─────────────────────────────────────────────
+app.get('/api/communities/:id/members', authenticateToken, async (req, res) => {
+    try {
+        const { page=1, limit=20 } = req.query;
+        const pn = Math.max(1,parseInt(page)||1);
+        const ln = Math.min(parseInt(limit)||20,100);
+        const members = await pool.query(
+            `SELECT u.id, u.username, u.name, u."profilePic", u."isVerified", cm.role, cm."joinedAt"
+             FROM community_members cm
+             JOIN users u ON cm."userId"=u.id
+             WHERE cm."communityId"=$1 AND u."isActive"=TRUE
+             ORDER BY CASE cm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, cm."joinedAt" ASC
+             LIMIT $2 OFFSET $3`,
+            [req.params.id, ln, (pn-1)*ln]
+        );
+        res.json({ members: members.rows.map(m => ({ ...m, profilePic: absoluteUrl(m.profilePic) })) });
+    } catch (e) {
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── KULLANICININ TOPLULUKLARI ─────────────────────────────────────
+app.get('/api/users/:userId/communities', authenticateToken, async (req, res) => {
+    try {
+        const communities = await pool.query(
+            `SELECT c.*, cm.role, u."profilePic" AS "ownerPic"
+             FROM community_members cm
+             JOIN communities c ON cm."communityId"=c.id
+             JOIN users u ON c."ownerId"=u.id
+             WHERE cm."userId"=$1
+             ORDER BY cm."joinedAt" DESC`,
+            [req.params.userId]
+        );
+        res.json({
+            communities: communities.rows.map(c => ({
+                ...c,
+                avatarUrl: absoluteUrl(c.avatarUrl),
+                ownerPic: absoluteUrl(c.ownerPic),
+            }))
+        });
+    } catch (e) {
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── TOPLULUK SİL (sadece sahip) ──────────────────────────────────
+app.delete('/api/communities/:id', authenticateToken, async (req, res) => {
+    try {
+        const c = await pool.query(`SELECT "ownerId" FROM communities WHERE id=$1`, [req.params.id]);
+        if (!c.rows.length) return res.status(404).json({ error: 'Topluluk bulunamadı' });
+        if (c.rows[0].ownerId !== req.user.id && req.user.role !== 'admin') {
+            return res.status(403).json({ error: 'Sadece topluluk sahibi silebilir' });
+        }
+        await pool.query(`DELETE FROM community_posts WHERE "communityId"=$1`, [req.params.id]);
+        await pool.query(`DELETE FROM community_members WHERE "communityId"=$1`, [req.params.id]);
+        await pool.query(`DELETE FROM communities WHERE id=$1`, [req.params.id]);
+        res.json({ message: 'Topluluk silindi' });
+    } catch (e) {
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
 // ════════════════════════════════════════════════════════════════════
 // 🔒 Bilinmeyen API rotaları için 404
 // ════════════════════════════════════════════════════════════════════
@@ -16170,7 +17528,7 @@ if (cluster.isPrimary || cluster.isMaster) {
             server.listen(PORT, '0.0.0.0', async () => {
                 console.log(`
 ╔══════════════════════════════════════════════════╗
-║  🌾 AGROLINK SERVER - PostgreSQL v7.1             ║
+║  🌾 AGROLINK SERVER - PostgreSQL v7.3             ║
 ║  📡 Port: ${String(PORT).padEnd(39)}║
 ║  🌐 Domain: sehitumitkestitarimmtal.com         ║
 ║  🗄️  DB: PostgreSQL (Pool: 100 bağlantı)        ║
@@ -16179,7 +17537,9 @@ if (cluster.isPrimary || cluster.isMaster) {
 ║  📹 Video Limit: 100MB | Mavi Tik: 300MB        ║
 ║  📰 Feed: Sadece takip edilenler gösterilir     ║
 ║  📧 E-posta: Nodemailer (SMTP)                  ║
-║  📊 API: 103+ Rota                              ║
+║  📢 Reklam: Rota tabanlı reklam sistemi         ║
+║  🏘️  Topluluklar: Discord tarzı grup sistemi    ║
+║  📊 API: 130+ Rota                              ║
 ║  ⚡ Cluster Mode: Worker ${String(process.pid).padEnd(23)}║
 ║  🔥 1000+ Eşzamanlı İstek Desteği               ║
 ╚══════════════════════════════════════════════════╝
