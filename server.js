@@ -3890,6 +3890,7 @@ const videosDir    = path.join(uploadsDir, 'videos');
 const thumbnailsDir= path.join(uploadsDir, 'thumbnails');
 const hlsDir       = path.join(uploadsDir, 'hls');
 const tempDir      = path.join(uploadsDir, 'temp');
+const musicDir     = path.join(uploadsDir, 'müzik');
 
 // ════════════════════════════════════════════════════════════════════
 // 🖼️ GÖRÜNTÜ İŞLEME — Concurrency Limiter + processImage Helper
@@ -3979,7 +3980,7 @@ async function processImageBuffer(inputBuffer, outputPath, opts = {}) {
     }
 }
 
-[uploadsDir, profilesDir, postsDir, videosDir, thumbnailsDir, hlsDir, tempDir].forEach(dir => {
+[uploadsDir, profilesDir, postsDir, videosDir, thumbnailsDir, hlsDir, tempDir, musicDir].forEach(dir => {
     if (!fssync.existsSync(dir)) {
         fssync.mkdirSync(dir, { recursive: true });
     }
@@ -4984,6 +4985,74 @@ app.use('/uploads/profiles', (req, res, next) => {
 
 app.use('/uploads', express.static(uploadsDir, { maxAge: '1y', dotfiles: 'deny' }));
 
+// ════════════════════════════════════════════════════════════════════
+// 🎵 MÜZİK KÜTÜPHANESİ — Ön uç media editörü için hazır parçalar
+// Dosya konumu: uploads/müzik/*.mp3  (veya .wav, .aac, .m4a)
+// Ön uç bu listeyi çeker → kullanıcı bir parça seçer → video/fotoğrafın
+// arkasına ekler → düzenlenmiş içeriği normal mp4 post olarak atar.
+// Sunucu tarafı işlem YOK: birleştirme tamamen ön uçta (Web Audio API /
+// FFmpeg.wasm) yapılır, sunucuya sadece bitmiş mp4 gelir.
+// ════════════════════════════════════════════════════════════════════
+
+// 🎵 Müzik dosyaları statik servis — indirilebilir + stream
+app.use('/uploads/müzik', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    // İndirilebilir olması için Content-Disposition: attachment kaldırıldı
+    // (ön uç hem stream hem blob URL ile kullanabilir)
+    const ext = path.extname(req.path).toLowerCase();
+    const mimeMap = {
+        '.mp3' : 'audio/mpeg',
+        '.wav' : 'audio/wav',
+        '.aac' : 'audio/aac',
+        '.m4a' : 'audio/mp4',
+        '.ogg' : 'audio/ogg',
+        '.flac': 'audio/flac',
+    };
+    if (mimeMap[ext]) res.setHeader('Content-Type', mimeMap[ext]);
+    next();
+}, express.static(musicDir, { maxAge: '7d', etag: true }));
+
+// GET /api/music/tracks — müzik listesini döndür (auth opsiyonel)
+// Ön uç bu listeyi çekip kullanıcıya gösterir.
+// Yanıt: { tracks: [{ id, name, filename, url, duration? }] }
+app.get('/api/music/tracks', async (req, res) => {
+    try {
+        const ALLOWED_EXTS = new Set(['.mp3', '.wav', '.aac', '.m4a', '.ogg', '.flac']);
+
+        // Klasör yoksa boş liste dön
+        if (!fssync.existsSync(musicDir)) {
+            return res.json({ tracks: [] });
+        }
+
+        const files = await fs.readdir(musicDir);
+        const tracks = files
+            .filter(f => {
+                const ext = path.extname(f).toLowerCase();
+                return ALLOWED_EXTS.has(ext) && !f.startsWith('.');
+            })
+            .map((filename, idx) => {
+                const ext  = path.extname(filename).toLowerCase();
+                const name = path.basename(filename, ext)
+                    .replace(/[-_]/g, ' ')           // tire/alt çizgi → boşluk
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                return {
+                    id      : idx + 1,
+                    name,
+                    filename,
+                    url     : `/uploads/m%C3%BCzik/${encodeURIComponent(filename)}`,
+                };
+            });
+
+        res.json({ tracks });
+    } catch (e) {
+        console.error('[Music] Tracks listesi hatası:', e.message);
+        res.status(500).json({ error: 'Müzik listesi alınamadı' });
+    }
+});
+
 
 
 // ════════════════════════════════════════════════════════════════════
@@ -5949,7 +6018,8 @@ app.post('/api/auth/register-init', registerLimiter, recaptchaMiddleware, upload
             emailVerificationRequired: true,
             requiresVerification: true,
             email: cleanEmail,
-            userId
+            userId,
+            profilePic: absoluteUrl(profilePic),
         });
     } catch (error) {
         console.error('Kayıt (init) hatası:', error);
@@ -6689,9 +6759,17 @@ async function isUserOnline(userId) {
 }
 
 // ─── 7. PROFİL GÜNCELLE ────────────────────────────────────────────
-app.put('/api/users/profile', authenticateToken, upload.fields([
-    { name: 'profilePic', maxCount: 1 }, { name: 'coverPic', maxCount: 1 }
-]), async (req, res) => {
+app.put('/api/users/profile', authenticateToken, (req, res, next) => {
+    upload.fields([
+        { name: 'profilePic', maxCount: 1 }, { name: 'coverPic', maxCount: 1 }
+    ])(req, res, (err) => {
+        if (err) {
+            console.error('[Profile] Multer hatası:', err.message);
+            return res.status(400).json({ error: err.message || 'Dosya yükleme hatası' });
+        }
+        next();
+    });
+}, async (req, res) => {
     try {
         const { name, bio, location, website } = req.body;
         const updates = [];
@@ -17219,6 +17297,9 @@ app.get('/api/communities', authenticateToken, async (req, res) => {
                 avatarUrl: absoluteUrl(c.avatarUrl),
                 bannerUrl: absoluteUrl(c.bannerUrl),
                 ownerPic: absoluteUrl(c.ownerPic),
+                // Frontend uyumluluğu için alias'lar
+                icon: absoluteUrl(c.avatarUrl),
+                coverImage: absoluteUrl(c.bannerUrl),
             }))
         });
     } catch (e) {
@@ -17262,6 +17343,10 @@ app.get('/api/communities/:slugOrId', authenticateToken, async (req, res) => {
                 avatarUrl: absoluteUrl(c.avatarUrl),
                 bannerUrl: absoluteUrl(c.bannerUrl),
                 ownerPic: absoluteUrl(c.ownerPic),
+                // Frontend uyumluluğu için alias'lar
+                icon: absoluteUrl(c.avatarUrl),
+                coverImage: absoluteUrl(c.bannerUrl),
+                ownerId: c.ownerId,
             }
         });
     } catch (e) {
@@ -17427,6 +17512,82 @@ app.get('/api/users/:userId/communities', authenticateToken, async (req, res) =>
             }))
         });
     } catch (e) {
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── TOPLULUĞU GÜNCELLE (sadece sahip) ────────────────────────────
+app.put('/api/communities/:id', authenticateToken, (req, res, next) => {
+    upload.fields([
+        { name: 'avatar', maxCount: 1 },
+        { name: 'banner', maxCount: 1 },
+    ])(req, res, (err) => {
+        if (err) return res.status(400).json({ error: err.message || 'Dosya yükleme hatası' });
+        next();
+    });
+}, async (req, res) => {
+    try {
+        const communityId = req.params.id;
+        const community = await pool.query(
+            `SELECT id, "ownerId", "avatarUrl", "bannerUrl" FROM communities WHERE id=$1`,
+            [communityId]
+        );
+        if (!community.rows.length) return res.status(404).json({ error: 'Topluluk bulunamadı' });
+        if (community.rows[0].ownerId !== req.user.id) return res.status(403).json({ error: 'Yetki yok' });
+
+        const { name, description, isPrivate } = req.body;
+        const updates = [];
+        const params = [];
+        let paramIdx = 1;
+
+        if (name !== undefined) { updates.push(`name = $${paramIdx++}`); params.push(name.substring(0, 100)); }
+        if (description !== undefined) { updates.push(`description = $${paramIdx++}`); params.push(description.substring(0, 1000)); }
+        if (isPrivate !== undefined) { updates.push(`"isPrivate" = $${paramIdx++}`); params.push(isPrivate === 'true' || isPrivate === true); }
+
+        if (req.files?.avatar?.[0]) {
+            const f = req.files.avatar[0];
+            const fname = `com_av_${uuidv4().replace(/-/g,'').slice(0,12)}.webp`;
+            await processImage(f.path, path.join(profilesDir, fname), { width: 300, height: 300, fit: 'cover', quality: 75, effort: 4 });
+            await require('fs').promises.unlink(f.path).catch(() => {});
+            updates.push(`"avatarUrl" = $${paramIdx++}`);
+            params.push(`/uploads/profiles/${fname}`);
+        }
+        if (req.files?.banner?.[0]) {
+            const f = req.files.banner[0];
+            const fname = `com_bn_${uuidv4().replace(/-/g,'').slice(0,12)}.webp`;
+            await processImage(f.path, path.join(postsDir, fname), { width: 1500, height: 500, fit: 'cover', quality: 80, effort: 4 });
+            await require('fs').promises.unlink(f.path).catch(() => {});
+            updates.push(`"bannerUrl" = $${paramIdx++}`);
+            params.push(`/uploads/posts/${fname}`);
+        }
+
+        if (updates.length === 0) return res.status(400).json({ error: 'Güncellenecek alan yok' });
+
+        updates.push(`"updatedAt" = NOW()`);
+        params.push(communityId);
+
+        await pool.query(
+            `UPDATE communities SET ${updates.join(', ')} WHERE id = $${paramIdx}`,
+            params
+        );
+
+        const updated = await pool.query(
+            `SELECT * FROM communities WHERE id=$1`,
+            [communityId]
+        );
+        const c = updated.rows[0];
+
+        res.json({
+            community: {
+                ...c,
+                avatarUrl: absoluteUrl(c.avatarUrl),
+                bannerUrl: absoluteUrl(c.bannerUrl),
+                icon: absoluteUrl(c.avatarUrl),
+                coverImage: absoluteUrl(c.bannerUrl),
+            }
+        });
+    } catch (e) {
+        console.error('[Communities] Güncelleme hatası:', e.message);
         res.status(500).json({ error: 'Sunucu hatası' });
     }
 });
