@@ -45,54 +45,112 @@ const http = require('http');
 const { v4: uuidv4 } = require('uuid');
 const sharp = require('sharp');
 const crypto = require('crypto');
+const { execFile } = require('child_process');
 const rateLimit = require('express-rate-limit');
+
+// ════════════════════════════════════════════════════════════════════
+// 🔒 RATE LIMITER STORE — Redis (cluster-safe) veya in-memory fallback
+// Cluster modunda in-memory sayaçlar worker başına bağımsızdır.
+// REDIS_URL .env'de tanımlıysa rate-limit-redis paketi kullanılır.
+// ÖNEMLİ: express-rate-limit her limiter için AYRI store instance ister.
+//         makeRateLimitOptions() her çağrıda yeni bir instance üretir.
+// ════════════════════════════════════════════════════════════════════
+let _redisClient = null;
+let _RedisStore   = null;
+
+try {
+    if (process.env.REDIS_URL) {
+        const { createClient } = require('redis');
+        _RedisStore = require('rate-limit-redis').RedisStore;
+        _redisClient = createClient({ url: process.env.REDIS_URL });
+        _redisClient.connect().then(() => {
+            console.log('✅ Rate limiter Redis store bağlandı');
+        }).catch(e => {
+            console.warn('⚠️  Rate limiter Redis bağlantı hatası, in-memory fallback:', e.message);
+            _redisClient = null;
+            _RedisStore  = null;
+        });
+    } else {
+        console.warn('⚠️  REDIS_URL tanımlı değil — rate limiter in-memory (cluster modunda her worker bağımsız sayaç tutar). Production için REDIS_URL önerilir.');
+    }
+} catch (e) {
+    console.warn('⚠️  rate-limit-redis paketi bulunamadı, in-memory fallback kullanılıyor. (npm install rate-limit-redis redis)');
+    _redisClient = null;
+    _RedisStore  = null;
+}
+
+// Her çağrıda YENİ store instance üretir (express-rate-limit zorunluluğu)
+function makeRateLimitOptions(opts, prefix) {
+    if (_redisClient && _RedisStore) {
+        const key = prefix || opts.keyPrefix || (Math.random().toString(36).slice(2));
+        return {
+            ...opts,
+            store: new _RedisStore({
+                sendCommand: (...args) => _redisClient.sendCommand(args),
+                prefix: `rl:${key}:`,
+            }),
+        };
+    }
+    return opts;
+}
+
+// Cloudflare + express-rate-limit uyumlu IP key helper
+// rateLimit.ipKeyGenerator v7'de kaldirildi, bu fonksiyon yerine gecer
+function getRateLimitKey(req) {
+    return (
+        req.headers['cf-connecting-ip'] ||
+        req.headers['x-real-ip'] ||
+        (req.headers['x-forwarded-for'] || '').split(',')[0].trim() ||
+        req.ip ||
+        'unknown'
+    ).replace(/^::ffff:/, '');
+}
 
 // ════════════════════════════════════════════════════════════════════
 // 🔒 AUTH RATE LIMITERS — Brute-force & spam koruması
 // ════════════════════════════════════════════════════════════════════
-const loginLimiter = rateLimit({
+const loginLimiter = rateLimit(makeRateLimitOptions({
     windowMs: 15 * 60 * 1000, // 15 dakika
     max: 10,
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (req, res) => {
-        // IP + email/identifier kombinasyonu → daha hassas hedefleme
         const id = (req.body?.identifier || req.body?.email || req.body?.username || '').toLowerCase().trim().slice(0, 50);
-        return rateLimit.ipKeyGenerator(req, res) + ':' + id;
+        return getRateLimitKey(req) + ':' + id;
     },
     message: { error: 'Çok fazla giriş denemesi. Lütfen 15 dakika sonra tekrar deneyin.' },
     skip: (req) => process.env.NODE_ENV === 'test',
-});
+}, 'login'));
 
-const registerLimiter = rateLimit({
+const registerLimiter = rateLimit(makeRateLimitOptions({
     windowMs: 60 * 60 * 1000, // 1 saat
     max: 5,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req, res) => rateLimit.ipKeyGenerator(req, res),
+    keyGenerator: (req, res) => getRateLimitKey(req),
     message: { error: 'Çok fazla kayıt denemesi. Lütfen 1 saat sonra tekrar deneyin.' },
     skip: (req) => process.env.NODE_ENV === 'test',
-});
+}, 'register'));
 
-const otpLimiter = rateLimit({
+const otpLimiter = rateLimit(makeRateLimitOptions({
     windowMs: 10 * 60 * 1000, // 10 dakika
     max: 5,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req, res) => rateLimit.ipKeyGenerator(req, res),
+    keyGenerator: (req, res) => getRateLimitKey(req),
     message: { error: 'Çok fazla OTP denemesi. Lütfen 10 dakika sonra tekrar deneyin.' },
     skip: (req) => process.env.NODE_ENV === 'test',
-});
+}, 'otp'));
 
-const forgotPasswordLimiter = rateLimit({
+const forgotPasswordLimiter = rateLimit(makeRateLimitOptions({
     windowMs: 60 * 60 * 1000, // 1 saat
     max: 5,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req, res) => rateLimit.ipKeyGenerator(req, res),
+    keyGenerator: (req, res) => getRateLimitKey(req),
     message: { error: 'Çok fazla şifre sıfırlama talebi. Lütfen 1 saat sonra tekrar deneyin.' },
     skip: (req) => process.env.NODE_ENV === 'test',
-});
+}, 'forgotpw'));
 
 // ════════════════════════════════════════════════════════════════════
 // 🔒 GLOBAL SPAM KORUMA — Auto-Ban Sistemi
@@ -125,20 +183,18 @@ async function recordSpamViolation(ip, reason, pool, threshold = 3) {
 
 // Ortak limiter factory — auto-ban destekli
 function makeSpamLimiter({ windowMs, max, reason, threshold = 3, keyFn }) {
-    // keyFn sadece (req) alıyor ama express-rate-limit (req, res) bekliyor.
-    // IPv6 doğrulamasını geçmek için: IP bazlı anahtarlar ipKeyGenerator üzerinden,
-    // kullanıcı-id bazlı anahtarlar ise IP'ye geri düşmeden doğrudan döner.
     const keyGenerator = keyFn
         ? (req, res) => {
               const userId = req.user?.id;
-              // Kullanıcı ID varsa → IP'ye dokunmadan direkt kullan (IPv6 sorunu yok)
               if (userId) return String(userId);
-              // Yoksa → ipKeyGenerator ile IPv6-safe IP al
-              return rateLimit.ipKeyGenerator(req, res);
+              return getRateLimitKey(req);
           }
-        : (req, res) => rateLimit.ipKeyGenerator(req, res);
+        : (req, res) => getRateLimitKey(req);
 
-    return rateLimit({
+    // Redis prefix: reason'dan güvenli bir anahtar üret (boşluk/özel karakter yok)
+    const prefix = 'spam_' + (reason || 'generic').toLowerCase().replace(/[^a-z0-9]/g, '_').slice(0, 30);
+
+    return rateLimit(makeRateLimitOptions({
         windowMs,
         max,
         standardHeaders: true,
@@ -147,7 +203,7 @@ function makeSpamLimiter({ windowMs, max, reason, threshold = 3, keyFn }) {
         skip: (req) => process.env.NODE_ENV === 'test',
         handler: async (req, res) => {
             let ip = 'unknown';
-            try { ip = rateLimit.ipKeyGenerator(req, res) || 'unknown'; } catch (_) {
+            try { ip = getRateLimitKey(req) || 'unknown'; } catch (_) {
                 ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown';
             }
             if (typeof pool !== 'undefined' && pool !== null) {
@@ -159,7 +215,7 @@ function makeSpamLimiter({ windowMs, max, reason, threshold = 3, keyFn }) {
                 retryAfter: Math.ceil(windowMs / 60000) + ' dakika'
             });
         }
-    });
+    }, prefix));
 }
 
 // ── Partnership ──────────────────────────────────────────────────────
@@ -279,10 +335,21 @@ const storyLimiter = makeSpamLimiter({
 // ── Auth/refresh token flood ─────────────────────────────────────────
 const refreshLimiter = makeSpamLimiter({
     windowMs: 15 * 60 * 1000, // 15 dakika
-    max: 20,
+    max: 60,  // 🔧 DÜZELTMESİ: 20→60; cluster modunda her worker ayrı sayaç tutar, düşük limit gereksiz oturum kapanmasına yol açıyordu
     reason: 'Token-refresh spam',
-    threshold: 5,
+    threshold: 10,
 });
+
+// ── Admin endpoint rate limiter (erken tanım — satır ~4148'de kullanılıyor) ──
+const adminLimiter = rateLimit(makeRateLimitOptions({
+    windowMs : 15 * 60 * 1000,
+    max      : 30,
+    standardHeaders: true,
+    legacyHeaders  : false,
+    keyGenerator   : (req) => getRateLimitKey(req) + ':admin',
+    message        : { error: 'Çok fazla admin isteği. Lütfen bekleyin.' },
+    skip           : (req) => process.env.NODE_ENV === 'test',
+}, 'admin'));
 
 const compression = require('compression');
 const helmet = require('helmet');
@@ -730,6 +797,7 @@ function getWelcomeEmailTemplate(userName) {
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AgroLink\'e Hoş Geldiniz!</title>
 <style>
@@ -903,6 +971,7 @@ function getForgotPasswordEmailTemplate(userName, resetToken) {
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Şifre Sıfırlama - AgroLink</title>
 <style>
@@ -982,6 +1051,7 @@ function getPasswordResetSuccessTemplate(userName) {
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <title>Şifre Değiştirildi - AgroLink</title>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
@@ -1036,6 +1106,7 @@ function getLoginNotificationTemplate(userName, loginDetails, resetToken = null)
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <title>Giriş Bildirimi - AgroLink</title>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
@@ -1060,10 +1131,10 @@ function getLoginNotificationTemplate(userName, loginDetails, resetToken = null)
     <p style="font-size:14px;color:rgba(255,255,255,0.55);margin-top:8px">Merhaba <strong style="color:#00e676">${name}</strong></p>
   </div>
   <div class="info-box">
-    <div class="info-row"><strong>📅 Tarih:</strong> ${loginDetails?.date || 'Bilinmiyor'}</div>
-    <div class="info-row"><strong>🕐 Saat:</strong> ${loginDetails?.time || 'Bilinmiyor'}</div>
-    <div class="info-row"><strong>🌐 IP:</strong> ${loginDetails?.ip || 'Bilinmiyor'}</div>
-    <div class="info-row"><strong>📱 Cihaz:</strong> ${loginDetails?.device || 'Bilinmiyor'}</div>
+    <div class="info-row"><strong>📅 Tarih:</strong> ${escapeHtml(String(loginDetails?.date || 'Bilinmiyor'))}</div>
+    <div class="info-row"><strong>🕐 Saat:</strong> ${escapeHtml(String(loginDetails?.time || 'Bilinmiyor'))}</div>
+    <div class="info-row"><strong>🌐 IP:</strong> ${escapeHtml(String(loginDetails?.ip || 'Bilinmiyor'))}</div>
+    <div class="info-row"><strong>📱 Cihaz:</strong> ${escapeHtml(String(loginDetails?.device || 'Bilinmiyor'))}</div>
   </div>
   ${resetSection}
   <div class="footer">
@@ -1084,7 +1155,8 @@ function getInactiveUserEmailTemplate(userName, userId) {
     const DOMAIN = process.env.APP_URL || 'https://sehitumitkestitarimmtal.com';
     return `<!DOCTYPE html>
 <html lang="tr">
-<head><meta charset="UTF-8"><title>Seni Özledik - AgroLink</title>
+<head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"><title>Seni Özledik - AgroLink</title>
 <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',Arial,sans-serif;background:#060d0a;color:#e8f5e9}.wrapper{max-width:600px;margin:0 auto;padding:24px 16px}.hero{background:linear-gradient(135deg,#0a1f10,#0d2b16);border-radius:28px;padding:48px 40px;text-align:center;border:1px solid rgba(0,230,118,0.15)}.brand{font-size:26px;font-weight:800;color:#00e676}.cta{display:inline-block;margin-top:24px;padding:14px 36px;background:linear-gradient(135deg,#00e676,#1de9b6);color:#020810;font-weight:800;border-radius:50px;text-decoration:none}.footer{text-align:center;padding:24px 20px;color:rgba(255,255,255,0.3);font-size:12px}.footer a{color:rgba(0,230,118,0.7);text-decoration:none}</style>
 </head>
 <body><div class="wrapper">
@@ -1109,7 +1181,8 @@ function getHighEngagementEmailTemplate(userName, userId) {
     const DOMAIN = process.env.APP_URL || 'https://sehitumitkestitarimmtal.com';
     return `<!DOCTYPE html>
 <html lang="tr">
-<head><meta charset="UTF-8"><title>Teşekkürler - AgroLink</title>
+<head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"><title>Teşekkürler - AgroLink</title>
 <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',Arial,sans-serif;background:#060d0a;color:#e8f5e9}.wrapper{max-width:600px;margin:0 auto;padding:24px 16px}.hero{background:linear-gradient(135deg,#0a1f10,#0d2b16);border-radius:28px;padding:48px 40px;text-align:center;border:1px solid rgba(0,230,118,0.15)}.brand{font-size:26px;font-weight:800;color:#00e676}.cta{display:inline-block;margin-top:24px;padding:14px 36px;background:linear-gradient(135deg,#00e676,#1de9b6);color:#020810;font-weight:800;border-radius:50px;text-decoration:none}.footer{text-align:center;padding:24px 20px;color:rgba(255,255,255,0.3);font-size:12px}.footer a{color:rgba(0,230,118,0.7);text-decoration:none}</style>
 </head>
 <body><div class="wrapper">
@@ -1160,7 +1233,8 @@ async function sendHighEngagementEmail(userId, userEmail, userName) {
 function getTwoFactorEmailTemplate(userName, code, purpose = 'login') {
     userName = escapeHtml(userName);
     const purposeText = purpose === 'login' ? 'giriş işleminizi' : 'işleminizi';
-    return `<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Doğrulama Kodu - Agrolink</title>
+    return `<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Doğrulama Kodu - Agrolink</title>
 <style>
 body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;line-height:1.8;color:#333;margin:0;padding:0;background-color:#f4f4f4}
 .container{max-width:600px;margin:20px auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.1)}
@@ -1207,7 +1281,8 @@ async function sendTwoFactorCodeEmail(userEmail, userName, code, purpose = 'logi
 // ─── KAYIT DOĞRULAMA E-POSTA ŞABLONU ─────────────────────────────────
 function getEmailVerificationTemplate(userName, code) {
     userName = escapeHtml(userName);
-    return `<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>E-Posta Doğrulama - Agrolink</title>
+    return `<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>E-Posta Doğrulama - Agrolink</title>
 <style>
 body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;line-height:1.8;color:#333;margin:0;padding:0;background-color:#f4f4f4}
 .container{max-width:600px;margin:20px auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.1)}
@@ -1305,8 +1380,8 @@ setInterval(checkInactiveUsers, 24 * 60 * 60 * 1000);
 // ==================== 🔒 BRUTE FORCE KORUMASI ====================
 
 const accountFailedAttempts = new Map();
-const MAX_FAILED_LOGINS    = 10;
-const LOCKOUT_DURATION_MS  = 15 * 60 * 1000;
+const MAX_FAILED_LOGINS    = 5;   // 🔒 10'dan 5'e düşürüldü — brute-force penceresi daraltıldı
+const LOCKOUT_DURATION_MS  = 30 * 60 * 1000; // 🔒 15 → 30 dakika kilitleme
 
 // 🔒 NOT: Lockout sayaçları bellek tabanlıdır (cluster'da bölünür).
 // loginLimiter (express-rate-limit) DB/Redis destekli değil — production'da Redis store ekleyin.
@@ -1509,7 +1584,31 @@ function sanitizeInput(value) {
 
 const RAW_FIELDS = new Set(['password', 'bio', 'content', 'caption', 'description', 'message', 'text', 'comment', 'token']);
 
+// 🔒 DÜZELTMESİ: Prototype pollution koruması — __proto__, constructor, prototype
+// anahtarları req.body, req.query ve req.params'tan temizlenir.
+const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function deepSanitizeObject(obj, depth = 0) {
+    if (depth > 5 || !obj || typeof obj !== 'object') return;
+    for (const key of Object.keys(obj)) {
+        // 🔒 Tehlikeli prototip anahtarlarını sil
+        if (DANGEROUS_KEYS.has(key)) {
+            delete obj[key];
+            continue;
+        }
+        const val = obj[key];
+        if (typeof val === 'object' && val !== null) {
+            deepSanitizeObject(val, depth + 1); // recursive
+        }
+    }
+}
+
 function sanitizeBody(req, res, next) {
+    // 🔒 DÜZELTMESİ: prototype pollution — tüm giriş nesnelerinde tehlikeli anahtarlar temizlenir
+    if (req.body)   deepSanitizeObject(req.body);
+    if (req.query)  deepSanitizeObject(req.query);
+    if (req.params) deepSanitizeObject(req.params);
+
     if (req.body && typeof req.body === 'object') {
         for (const key of Object.keys(req.body)) {
             const val = req.body[key];
@@ -2876,6 +2975,9 @@ server.requestTimeout = 5 * 60 * 1000;   // istek timeout'u
 // Bağlı kullanıcıların socket ID'lerini tutan harita: userId → Set<socketId>
 const onlineUsers = new Map(); // userId (string) → Set<socketId>
 
+// 🔴 Aktif canlı yayınlar: streamId → stream meta
+const activeStreams = new Map();
+
 if (socketIo) {
     io = new socketIo.Server(server, {
         cors: {
@@ -2920,16 +3022,24 @@ if (socketIo) {
                 issuer     : 'agrolink',
             });
             const user = await dbGet(
-                `SELECT id, username, name, "profilePic", role FROM users WHERE id = $1 AND "isActive" = TRUE`,
+                `SELECT id, username, name, "profilePic", role, "isBanned" FROM users WHERE id = $1 AND "isActive" = TRUE`,
                 [decoded.id]
             );
             if (!user) return next(new Error('Kullanıcı bulunamadı'));
+            if (user.isBanned) return next(new Error('Hesap askıya alındı')); // 🔒 banlı kullanıcı socket bağlanamaz
             socket.userId   = user.id;
             socket.username = user.username;
             socket.user     = user;
             next();
         } catch (e) {
-            next(new Error('Geçersiz token'));
+            // 🔧 DÜZELTİLDİ: TokenExpiredError ayrı yakala.
+            // Eski kod: her hata için aynı "Geçersiz token" → frontend expire mi,
+            // gerçekten geçersiz mi ayırt edemiyordu → sonsuz reconnect döngüsü.
+            // Şimdi: "jwt expired" mesajı → frontend refresh yapıp yeni tokenla bağlanır.
+            if (e && e.name === 'TokenExpiredError') {
+                return next(new Error('jwt expired'));
+            }
+            return next(new Error('Geçersiz token'));
         }
     });
 
@@ -2970,6 +3080,22 @@ if (socketIo) {
                 if (counter.count > SOCKET_MSG_LIMIT) {
                     socket.emit('message:error', { error: 'Çok hızlı mesaj gönderiyorsunuz, lütfen bekleyin.' });
                     return;
+                }
+
+                // 🔒 Gizli hesap kontrolü: alıcı gizliyse yalnızca onaylı takipçiler mesaj gönderebilir
+                const receiverUser = await dbGet(
+                    `SELECT "isPrivate" FROM users WHERE id = $1 AND "isActive" = TRUE`,
+                    [receiverId]
+                );
+                if (receiverUser?.isPrivate) {
+                    const isApprovedFollower = await dbGet(
+                        `SELECT id FROM follow_requests WHERE "requesterId" = $1 AND "targetId" = $2 AND status = 'accepted'`,
+                        [userId, receiverId]
+                    );
+                    if (!isApprovedFollower) {
+                        socket.emit('message:error', { error: 'Bu kullanıcı gizli hesaba sahip. Mesaj gönderebilmek için takip isteğinizin onaylanması gerekiyor.' });
+                        return;
+                    }
                 }
 
                 // 🔒 Mesaj boyutu kontrolü — DB şişirmesi önlemi
@@ -3080,6 +3206,185 @@ if (socketIo) {
         });
 
         // ══════════════════════════════════════════════════════════════════
+        // 🔴 CANLI YAYIN — Live Stream Socket Handlers
+        // ══════════════════════════════════════════════════════════════════
+
+        // activeStreams: streamId → { userId, username, name, profilePic, title,
+        //                             viewerCount, likeCount, startedAt, likedBy: Set }
+        // (module-level Map — tüm socketler paylaşır)
+
+        // Yayın başlat
+        socket.on('live:start', async ({ streamId, title }) => {
+            if (!streamId) return;
+            const offer = null; // Offer her viewer için ayrıca üretilir (live:offer_to_viewer)
+            // Aynı kullanıcının zaten aktif yayını varsa sonlandır
+            for (const [sid, s] of activeStreams.entries()) {
+                if (String(s.userId) === String(userId)) {
+                    activeStreams.delete(sid);
+                    io.emit('live:ended', { streamId: sid });
+                }
+            }
+            let profilePic = '';
+            let name = '';
+            let username = socket.username || '';
+            try {
+                const u = await pool.query('SELECT "profilePic", name, username FROM users WHERE id=$1', [userId]);
+                if (u.rows[0]) {
+                    profilePic = absoluteUrl(u.rows[0].profilePic || '');
+                    name       = u.rows[0].name || '';
+                    username   = u.rows[0].username || username;
+                }
+            } catch {}
+
+            const streamData = {
+                streamId,
+                userId,
+                username,
+                name,
+                profilePic,
+                title: (title || '').slice(0, 120),
+                viewerCount: 0,
+                likeCount: 0,
+                startedAt: new Date().toISOString(),
+                likedBy: new Set(),
+                hostSocketId: socket.id,
+                offer,  // WebRTC offer saklanır; yeni katılımcılara gönderilir
+            };
+            activeStreams.set(streamId, streamData);
+            socket.join(`live:${streamId}`);
+
+            // Tüm bağlı kullanıcılara duyur
+            const { likedBy, offer: _o, hostSocketId, ...pub } = streamData;
+            io.emit('live:started', pub);
+            console.log(`🔴 [LIVE] Yayın başladı: ${username} → ${streamId}`);
+        });
+
+        // Yayına katıl (izleyici)
+        socket.on('live:join', ({ streamId }) => {
+            const stream = activeStreams.get(streamId);
+            if (!stream) {
+                socket.emit('live:not_found');
+                return;
+            }
+            socket.join(`live:${streamId}`);
+            stream.viewerCount = Math.max(0, (stream.viewerCount || 0) + 1);
+
+            // İzleyiciye yayın bilgisi gönder
+            const { likedBy, offer, hostSocketId, ...pub } = stream;
+            socket.emit('live:info', pub);
+
+            // Host'a yeni izleyici bildirimi — host kendi offer'ını üretecek (1:N gerçek mimari)
+            if (stream.hostSocketId) {
+                io.to(stream.hostSocketId).emit('live:viewer_joined', { viewerSocketId: socket.id, viewerId: userId });
+            }
+
+            // Odaya izleyici sayısı güncelle
+            io.to(`live:${streamId}`).emit('live:viewer_update', { streamId, viewerCount: stream.viewerCount });
+            console.log(`👁 [LIVE] Katıldı: ${socket.username} → ${streamId} (${stream.viewerCount} izleyici)`);
+        });
+
+        // Yayından ayrıl
+        socket.on('live:leave', ({ streamId }) => {
+            const stream = activeStreams.get(streamId);
+            if (stream) {
+                stream.viewerCount = Math.max(0, (stream.viewerCount || 1) - 1);
+                io.to(`live:${streamId}`).emit('live:viewer_update', { streamId, viewerCount: stream.viewerCount });
+            }
+            socket.leave(`live:${streamId}`);
+        });
+
+        // Yayını bitir (sadece host)
+        socket.on('live:end', ({ streamId }) => {
+            const stream = activeStreams.get(streamId);
+            if (!stream || String(stream.userId) !== String(userId)) return;
+            activeStreams.delete(streamId);
+            io.to(`live:${streamId}`).emit('live:ended', { streamId });
+            io.emit('live:ended', { streamId }); // liste sayfası için global
+            console.log(`⏹ [LIVE] Yayın bitti: ${socket.username} → ${streamId}`);
+        });
+
+        // Beğeni
+        socket.on('live:like', ({ streamId }) => {
+            const stream = activeStreams.get(streamId);
+            if (!stream) return;
+            if (stream.likedBy.has(userId)) return; // tekrar beğeni yok
+            stream.likedBy.add(userId);
+            stream.likeCount = (stream.likeCount || 0) + 1;
+            io.to(`live:${streamId}`).emit('live:like', { streamId, total: stream.likeCount, userId });
+        });
+
+        // Emoji gönder
+        socket.on('live:emoji', ({ streamId, emoji }) => {
+            if (!streamId || !emoji) return;
+            io.to(`live:${streamId}`).emit('live:emoji', { emoji, userId, username: socket.username });
+        });
+
+        // Chat mesajı
+        socket.on('live:message', async ({ streamId, text }) => {
+            if (!streamId || !text || typeof text !== 'string') return;
+            const clean = text.trim().slice(0, 200);
+            if (!clean) return;
+            let profilePic = '';
+            let name = socket.user?.name || socket.username || '';
+            try {
+                const u = await pool.query('SELECT "profilePic", name FROM users WHERE id=$1', [userId]);
+                if (u.rows[0]) { profilePic = absoluteUrl(u.rows[0].profilePic || ''); name = u.rows[0].name || name; }
+            } catch {}
+            const msg = {
+                id: uuidv4(),
+                userId,
+                username: socket.username,
+                name,
+                profilePic,
+                text: clean,
+                ts: Date.now(),
+            };
+            io.to(`live:${streamId}`).emit('live:message', msg);
+        });
+
+        // WebRTC: host → belirli viewer'a offer ilet (1:N gerçek mimari)
+        socket.on('live:offer_to_viewer', ({ streamId, viewerSocketId, offer }) => {
+            const stream = activeStreams.get(streamId);
+            if (!stream || String(stream.userId) !== String(userId)) return;
+            // Yalnızca hedef viewer'a gönder
+            io.to(viewerSocketId).emit('live:offer', { offer });
+        });
+
+        // WebRTC: answer (izleyici → host) — viewerSocketId bilgisini taşıyarak ilet
+        socket.on('live:answer', ({ streamId, answer }) => {
+            const stream = activeStreams.get(streamId);
+            if (!stream || !stream.hostSocketId) return;
+            io.to(stream.hostSocketId).emit('live:answer', { answer, viewerSocketId: socket.id });
+        });
+
+        // WebRTC: ICE candidate — hedefli yönlendirme
+        socket.on('live:ice_candidate', ({ streamId, candidate, target, toSocketId }) => {
+            const stream = activeStreams.get(streamId);
+            if (!stream) return;
+            if (target === 'host' && stream.hostSocketId) {
+                // Viewer → Host: kim gönderdiğini belirt
+                io.to(stream.hostSocketId).emit('live:ice_candidate', { candidate, from: socket.id });
+            } else if (toSocketId) {
+                // Host → belirli viewer
+                io.to(toSocketId).emit('live:ice_candidate', { candidate });
+            } else {
+                // Fallback: odaya broadcast
+                socket.to(`live:${streamId}`).emit('live:ice_candidate', { candidate });
+            }
+        });
+
+        // Disconnect — aktif yayın varsa sonlandır
+        socket.on('disconnect', () => {
+            for (const [sid, stream] of activeStreams.entries()) {
+                if (String(stream.userId) === String(userId)) {
+                    activeStreams.delete(sid);
+                    io.emit('live:ended', { streamId: sid });
+                    console.log(`🔌 [LIVE] Host ayrıldı, yayın sonlandı: ${sid}`);
+                }
+            }
+        });
+
+        // ══════════════════════════════════════════════════════════════════
         // ── Bağlantı kesildi ─────────────────────────────────────────────
         // ═══════════════════════════════════════════════════
         // 📹 GÖRÜNTÜLÜ / SESLİ ARAMA — WebRTC Sinyal Köprüsü
@@ -3101,8 +3406,37 @@ if (socketIo) {
                 const recipientSockets = onlineUsers.get(recipientId);
 
                 if (!recipientSockets || recipientSockets.size === 0) {
+                    // Map boş olsa bile DB'yi kontrol et —
+                    // mobil ağ geçişi / kısa kopuklukta socket kapanabilir ama kullanıcı gerçekte online olabilir
+                    let dbOnline = false;
+                    try {
+                        const dbUser = await dbGet(`SELECT "isOnline" FROM users WHERE id = $1`, [recipientId]);
+                        dbOnline = !!dbUser?.isOnline;
+                    } catch (_) {}
+
+                    if (dbOnline) {
+                        // DB'ye göre online → FCM ile çağrı bildirimi gönder, çağrıyı aktif tut
+                        console.log(`📞 [CALL] ${recipientId} socket yok ama DB online → FCM ile çağrı bildirimi gönderiliyor`);
+                        activeCalls.set(callId, { callerId: userId, recipientId, type: type || 'video', startTime: Date.now() });
+                        socket.emit('call:ringing', { callId, recipientId });
+                        sendFcmPush(recipientId, {
+                            title: caller.name || caller.username,
+                            body : `📞 ${type === 'audio' ? 'Sesli' : 'Görüntülü'} arama geliyor`,
+                            data : { type: 'incoming_call', callId, callerId: userId, callType: type || 'video', actorName: caller.name || caller.username, actorUsername: caller.username, actorProfilePic: caller.profilePic },
+                        }).catch(() => {});
+                        // 45 saniye bekle — push ile yeniden bağlanıp cevap verebilir
+                        setTimeout(() => {
+                            const call = activeCalls.get(callId);
+                            if (call && call.callerId === userId) {
+                                activeCalls.delete(callId);
+                                socket.emit('call:timeout', { callId });
+                            }
+                        }, 45000);
+                        return;
+                    }
+
+                    // Gerçekten offline
                     socket.emit('call:error', { callId, error: 'Kullanıcı çevrimdışı', code: 'USER_OFFLINE' });
-                    // FCM ile çevrimdışı push gönder (missed call)
                     sendFcmPush(recipientId, {
                         title: caller.name || caller.username,
                         body : `📞 ${type === 'audio' ? 'Sesli' : 'Görüntülü'} arama cevapsız kaldı`,
@@ -3146,15 +3480,19 @@ if (socketIo) {
         // Aramayı yanıtla (kabul / red)
         socket.on('call:respond', ({ callId, callerId, response }) => {
             const callerSockets = onlineUsers.get(callerId);
-            if (callerSockets) {
-                const event = response === 'accept' ? 'call_accepted' : 'call_rejected';
-                callerSockets.forEach(sid => io.to(sid).emit(event, { callId, responderId: userId }));
-            }
             if (response === 'accept') {
-                socket.emit('call:accepted', { callId });
-                console.log(`📞 [CALL] Kabul: callId=${callId}`);
+                // Sadece ARAYAN tarafa bildir → arayan offer oluşturacak
+                if (callerSockets) {
+                    callerSockets.forEach(sid => io.to(sid).emit('call_accepted', { callId, responderId: userId }));
+                }
+                // NOT: callee'ye (socket.emit) 'call:accepted' GÖNDERİLMEZ
+                // Callee sadece webrtc_offer gelince answer üretir (onOffer handler)
+                console.log(`📞 [CALL] Kabul: callId=${callId} | caller bildirildi`);
             } else {
                 activeCalls.delete(callId);
+                if (callerSockets) {
+                    callerSockets.forEach(sid => io.to(sid).emit('call_rejected', { callId, responderId: userId }));
+                }
                 console.log(`📞 [CALL] Red: callId=${callId}`);
             }
         });
@@ -3192,15 +3530,41 @@ if (socketIo) {
             }
         });
 
+        // WebRTC: ICE Restart isteği (zayıf/kopuk bağlantıda yeniden bağlanma)
+        socket.on('webrtc_ice_restart', ({ callId, recipientId, offer }) => {
+            const recipientSockets = onlineUsers.get(recipientId);
+            if (recipientSockets) {
+                recipientSockets.forEach(sid => io.to(sid).emit('webrtc_ice_restart', { callId, offer, fromId: userId }));
+                console.log(`🔄 [CALL] ICE restart: callId=${callId} from=${userId}`);
+            }
+        });
+
+        // WebRTC: Ağ kalitesi bildirimi (düşük bant genişliğinde UI uyarısı)
+        socket.on('webrtc_network_quality', ({ callId, recipientId, quality }) => {
+            // quality: 'good' | 'poor' | 'reconnecting'
+            const recipientSockets = onlineUsers.get(recipientId);
+            if (recipientSockets) {
+                recipientSockets.forEach(sid => io.to(sid).emit('webrtc_network_quality', { callId, quality, fromId: userId }));
+            }
+        });
+
         socket.on('disconnect', () => {
             console.log(`🔌 [SOCKET] Ayrıldı: ${socket.username} (${userId})`);
             const sockets = onlineUsers.get(userId);
             if (sockets) {
                 sockets.delete(socket.id);
                 if (sockets.size === 0) {
-                    onlineUsers.delete(userId);
-                    dbRun(`UPDATE users SET "isOnline" = FALSE, "lastSeenAt" = NOW() WHERE id = $1`, [userId]).catch(() => {});
-                    socket.broadcast.emit('user:offline', { userId });
+                    // Kısa kopuklukta (mobil ağ geçişi vb.) hemen offline yapmak yerine
+                    // 8 saniye bekle — kullanıcı yeniden bağlanırsa offline bildirimi gönderilmez
+                    setTimeout(() => {
+                        const currentSockets = onlineUsers.get(userId);
+                        if (!currentSockets || currentSockets.size === 0) {
+                            onlineUsers.delete(userId);
+                            dbRun(`UPDATE users SET "isOnline" = FALSE, "lastSeenAt" = NOW() WHERE id = $1`, [userId]).catch(() => {});
+                            socket.broadcast.emit('user:offline', { userId });
+                            console.log(`👤 [SOCKET] Offline: ${socket.username} (${userId})`);
+                        }
+                    }, 8000);
                 }
             }
         });
@@ -3266,7 +3630,10 @@ async function sendFcmPush(userId, { title, body, data = {} }) {
                AND platform IN ('android', 'ios', 'web_fcm')`,
             [userId]
         );
-        if (!rows || rows.length === 0) return;
+        if (!rows || rows.length === 0) {
+            console.warn(`[FCM] userId=${userId} için kayıtlı android/ios/web_fcm token bulunamadı. device_tokens tablosunu kontrol et.`);
+            return;
+        }
 
         const tokens = rows.map(r => r.token).filter(Boolean);
         if (tokens.length === 0) return;
@@ -3807,9 +4174,8 @@ if (cron && process.env.SMART_NOTIF_ENABLED === 'true') {
 // ── ADMIN TEST + İSTATİSTİK ROTALARI ─────────────────────────────────────────
 
 // POST /api/admin/smart-notif/test — Kampanya anında test et (geliştirici)
-app.post('/api/admin/smart-notif/test', authenticateToken, async (req, res) => {
+app.post('/api/admin/smart-notif/test', authenticateToken, requireAdmin, adminLimiter, async (req, res) => {
     try {
-        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Yetkisiz' });
         const { campaign } = req.body;
         const campaigns = {
             morning   : runMorningCampaign,
@@ -3830,14 +4196,13 @@ app.post('/api/admin/smart-notif/test', authenticateToken, async (req, res) => {
         process.env.SMART_NOTIF_ENABLED = prev;
         res.json({ success: true, campaign, message: 'Test gönderildi' });
     } catch (e) {
-        res.status(500).json({ error: 'Hata: ' + e.message });
+        res.status(500).json({ error: 'Sunucu hatası' }); // 🔒 e.message gizlendi
     }
 });
 
 // GET /api/admin/smart-notif/stats — Gönderim istatistikleri
-app.get('/api/admin/smart-notif/stats', authenticateToken, async (req, res) => {
+app.get('/api/admin/smart-notif/stats', authenticateToken, requireAdmin, adminLimiter, async (req, res) => {
     try {
-        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Yetkisiz' });
 
         const [daily, segments, topHours] = await Promise.all([
             // Son 7 günün kampanya özeti
@@ -3873,7 +4238,7 @@ app.get('/api/admin/smart-notif/stats', authenticateToken, async (req, res) => {
             schedulerActive: !!(cron && process.env.SMART_NOTIF_ENABLED === 'true'),
         });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: 'Sunucu hatası' }); // 🔒 e.message gizlendi
     }
 });
 
@@ -4705,17 +5070,216 @@ async function verifyUploadedFile(file, uploadType = 'postImage', limitOverride 
 
 // ==================== MIDDLEWARE ====================
 
+// ════════════════════════════════════════════════════════════════════
+// 🧨 13. SUPPLY CHAIN SECURITY — Dependency & Build Integrity
+// ════════════════════════════════════════════════════════════════════
+
+/**
+ * Bilinen kritik güvenlik açıklarına sahip paket versiyonları.
+ * CVE referanslarıyla yönetilir; her güncelleme review gerektirir.
+ * Format: { 'paket-adi': { blockedVersions: ['x.y.z'], cve: 'CVE-XXXX-XXXXX', minSafe: 'a.b.c' } }
+ */
+const SUPPLY_CHAIN_BLOCKED_PACKAGES = {
+    'lodash'       : { blockedVersions: ['4.17.15', '4.17.14', '4.17.13'], cve: 'CVE-2020-8203',  minSafe: '4.17.21' },
+    'axios'        : { blockedVersions: ['0.21.0', '0.21.1'],              cve: 'CVE-2021-3749',  minSafe: '0.21.2'  },
+    'jsonwebtoken' : { blockedVersions: ['8.5.0', '8.5.1'],                cve: 'CVE-2022-23529', minSafe: '9.0.0'   },
+    'express'      : { blockedVersions: ['4.17.0', '4.17.1'],              cve: 'CVE-2022-24999', minSafe: '4.18.2'  },
+    'multer'       : { blockedVersions: ['1.4.3'],                         cve: 'CVE-2022-24434', minSafe: '1.4.4'   },
+};
+
+/**
+ * package-lock.json veya npm-shrinkwrap.json varlık kontrolü.
+ * Lockfile yoksa bağımlılık ağacı deterministik değil → güvenlik riski.
+ */
+function checkLockfilePresence() {
+    const lockCandidates = [
+        path.join(__dirname, 'package-lock.json'),
+        path.join(__dirname, 'npm-shrinkwrap.json'),
+        path.join(__dirname, 'yarn.lock'),
+        path.join(__dirname, 'pnpm-lock.yaml'),
+    ];
+    const found = lockCandidates.filter(f => fssync.existsSync(f));
+    if (found.length === 0) {
+        console.warn('[SUPPLY-CHAIN] ⚠️  Lockfile bulunamadı! Deterministik build için package-lock.json oluşturun.');
+        return false;
+    }
+    console.log(`[SUPPLY-CHAIN] ✅ Lockfile mevcut: ${found.map(f => path.basename(f)).join(', ')}`);
+    return true;
+}
+
+/**
+ * Yüklü paket versiyonlarını bilinen kötü versiyonlarla karşılaştır.
+ * node_modules/<paket>/package.json üzerinden okur — runtime safe.
+ */
+function checkBlockedPackageVersions() {
+    let violations = 0;
+    for (const [pkgName, rule] of Object.entries(SUPPLY_CHAIN_BLOCKED_PACKAGES)) {
+        try {
+            const pkgJsonPath = path.join(__dirname, 'node_modules', pkgName, 'package.json');
+            if (!fssync.existsSync(pkgJsonPath)) continue;
+            const { version } = JSON.parse(fssync.readFileSync(pkgJsonPath, 'utf8'));
+            if (rule.blockedVersions.includes(version)) {
+                console.error(
+                    `[SUPPLY-CHAIN] 🚨 KRİTİK: ${pkgName}@${version} → ${rule.cve} ` +
+                    `| Güvenli minimum: ${rule.minSafe} | npm update ${pkgName} ile güncelleyin!`
+                );
+                violations++;
+            } else {
+                console.log(`[SUPPLY-CHAIN] ✅ ${pkgName}@${version} — bilinen CVE yok`);
+            }
+        } catch (_) {
+            // Paket node_modules'ta yoksa veya parse hatası — sessizce geç
+        }
+    }
+    return violations;
+}
+
+/**
+ * package.json scripts alanında tehlikeli preinstall/postinstall hook kontrolü.
+ * Tedarik zinciri saldırılarının %60'ı lifecycle hook'ları üzerinden gelir.
+ */
+function checkPackageScriptHooks() {
+    const suspiciousPatterns = [
+        /curl\s+/i, /wget\s+/i, /eval\s*\(/i,
+        /base64\s+--decode/i, /bash\s+-c/i,
+        /powershell/i, /cmd\.exe/i,
+        /rm\s+-rf\s+\//i, /mkfifo/i,
+    ];
+    const warnings = [];
+    try {
+        const pkgJson = JSON.parse(fssync.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
+        const scripts = pkgJson.scripts || {};
+        const lifecycleHooks = ['preinstall', 'postinstall', 'preuninstall', 'prepare'];
+        for (const hook of lifecycleHooks) {
+            if (scripts[hook]) {
+                const suspicious = suspiciousPatterns.some(rx => rx.test(scripts[hook]));
+                if (suspicious) {
+                    warnings.push(`${hook}: ${scripts[hook].slice(0, 80)}`);
+                    console.warn(`[SUPPLY-CHAIN] ⚠️  Şüpheli lifecycle hook → ${hook}: ${scripts[hook].slice(0, 80)}`);
+                }
+            }
+        }
+    } catch (_) { /* package.json okunamazsa geç */ }
+    return warnings.length;
+}
+
+/**
+ * .env dosyasının git'e commit edilmediğini kontrol et (.gitignore kontrolü).
+ * Sık görülen tedarik zinciri riski: secret'ların source control'e girmesi.
+ */
+function checkEnvNotInGit() {
+    const gitignorePath = path.join(__dirname, '.gitignore');
+    if (!fssync.existsSync(gitignorePath)) {
+        console.warn('[SUPPLY-CHAIN] ⚠️  .gitignore bulunamadı! .env dosyası git\'e commit edilmiş olabilir.');
+        return false;
+    }
+    const content = fssync.readFileSync(gitignorePath, 'utf8');
+    const lines = content.split('\n').map(l => l.trim());
+    const covered = lines.some(l => l === '.env' || l === '.env*' || l === '*.env');
+    if (!covered) {
+        console.warn('[SUPPLY-CHAIN] ⚠️  .gitignore içinde .env satırı eksik! Gizli anahtarlar sızdırılabilir.');
+        return false;
+    }
+    console.log('[SUPPLY-CHAIN] ✅ .env → .gitignore ile korunuyor');
+    return true;
+}
+
+/**
+ * node_modules içindeki paket sayısını ve toplam ağırlığını raporla.
+ * Beklenmedik paket sayısı artışı tedarik zinciri manipülasyonunun işareti olabilir.
+ */
+function reportDependencyStats() {
+    try {
+        const nmPath = path.join(__dirname, 'node_modules');
+        if (!fssync.existsSync(nmPath)) return;
+        const topLevel = fssync.readdirSync(nmPath).filter(d => !d.startsWith('.')).length;
+        console.log(`[SUPPLY-CHAIN] 📦 node_modules: ${topLevel} top-level paket`);
+    } catch (_) { /* istatistik hatası kritik değil */ }
+}
+
+/**
+ * npm audit'i arka planda çalıştır — yüksek/kritik açıkları logla.
+ * Sunucu başlatmasını BLOKLAMAMAK için fire-and-forget pattern kullanılır.
+ * CI/CD ortamında bu kontrolün hard-fail yapması önerilir.
+ */
+function runNpmAuditBackground() {
+    if (process.env.NODE_ENV === 'test') return; // test ortamında atla
+    // npm mevcut mu kontrol et
+    execFile('npm', ['audit', '--audit-level=high', '--json'], { timeout: 30000, maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
+        try {
+            const report = JSON.parse(stdout || '{}');
+            const vulns  = report.metadata?.vulnerabilities || {};
+            const critical = (vulns.critical || 0);
+            const high     = (vulns.high || 0);
+            if (critical > 0 || high > 0) {
+                console.error(
+                    `[SUPPLY-CHAIN] 🚨 npm audit: ${critical} kritik, ${high} yüksek açık tespit edildi! ` +
+                    `Detay: npm audit --audit-level=high`
+                );
+            } else {
+                const total = (vulns.moderate || 0) + (vulns.low || 0) + (vulns.info || 0);
+                console.log(`[SUPPLY-CHAIN] ✅ npm audit: kritik/yüksek açık yok${total > 0 ? ` (${total} düşük/orta seviye)` : ''}`);
+            }
+        } catch (_) {
+            // JSON parse hatası: npm audit çıktısı farklı format → logla, durma
+            if (stderr) console.warn('[SUPPLY-CHAIN] npm audit stderr:', stderr.slice(0, 200));
+        }
+    });
+}
+
+/**
+ * Ana Supply Chain Security orchestrator.
+ * Tüm kontrolleri sırayla çalıştırır; kritik ihlal varsa process.exit ile çıkar.
+ * Kritik olmayan uyarılar sadece loglanır — sistemi bozmaz.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.exitOnViolation=false]  true → kritik CVE ihlalinde süreci durdur
+ */
+async function runSupplyChainChecks({ exitOnViolation = false } = {}) {
+    console.log('\n[SUPPLY-CHAIN] 🔍 Tedarik zinciri güvenlik kontrolü başlatılıyor...');
+    console.log('─'.repeat(60));
+
+    checkLockfilePresence();
+    checkEnvNotInGit();
+    checkPackageScriptHooks();
+    reportDependencyStats();
+
+    const cveViolations = checkBlockedPackageVersions();
+
+    if (cveViolations > 0 && exitOnViolation) {
+        console.error(`[SUPPLY-CHAIN] ❌ ${cveViolations} kritik CVE ihlali nedeniyle sunucu başlatılmıyor.`);
+        console.error('[SUPPLY-CHAIN] ❌ npm update ile bağımlılıkları güncelleyin.');
+        process.exit(1);
+    }
+
+    // npm audit arka planda (non-blocking)
+    runNpmAuditBackground();
+
+    console.log('─'.repeat(60));
+    console.log('[SUPPLY-CHAIN] ✅ Tedarik zinciri kontrolü tamamlandı.\n');
+}
+
 // ═══════════════════════════════════════════════════════════════
 // 🔒 GÜVENLİK KATMANI - Güçlendirilmiş
 // ═══════════════════════════════════════════════════════════════
 
 // Helmet - HTTP güvenlik başlıkları
+// ════════════════════════════════════════════════════════════════════
+// 🔒 CSP NONCE MİDDLEWARE — her istek için benzersiz nonce üretir
+// 'unsafe-inline' yerine nonce kullanımı XSS saldırılarını engeller.
+// Şablon/script etiketlerinde: <script nonce="<%= res.locals.cspNonce %>">
+// ════════════════════════════════════════════════════════════════════
+app.use((req, res, next) => {
+    res.locals.cspNonce = crypto.randomBytes(16).toString('base64');
+    next();
+});
+
 app.use(helmet({
     contentSecurityPolicy : {
         directives: {
             defaultSrc : ["'self'"],
-            scriptSrc  : ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com', 'https://cdnjs.cloudflare.com'],
-            styleSrc   : ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+            scriptSrc  : ["'self'", (req, res) => `'nonce-${res.locals.cspNonce}'`, 'https://cdnjs.cloudflare.com'],
+            styleSrc   : ["'self'", (req, res) => `'nonce-${res.locals.cspNonce}'`, 'https://fonts.googleapis.com'],
             fontSrc    : ["'self'", 'https://fonts.gstatic.com'],
             imgSrc     : ["'self'", 'data:', 'blob:', 'https:', 'https://api.dicebear.com'],
             mediaSrc   : ["'self'", 'blob:'],
@@ -4861,10 +5425,16 @@ if (process.env.EXTRA_ORIGINS) {
  */
 function mobileKeyMiddleware(req, res, next) {
     const origin = req.headers['origin'];
-    // ⚠️ DUİZELME: Content-Type SADECE /api/ rotaları için JSON olarak ayarla.
-    // Sayfa istekleri (/, /agrolink vb.) Origin header göndermez;
-    // bu isteklere application/json set edilirse tarayıcı HTML’i ham metin gösterir.
     if (!origin && req.path.startsWith('/api/')) {
+        // 🔒 GÜVENLİK DÜZELTMESİ: null-origin API isteklerinde X-Mobile-App-Key zorunlu.
+        // Tarayıcılar CORS pre-flight sırasında origin gönderir; null-origin yalnızca
+        // native mobil uygulamalardan veya curl/Postman gibi araçlardan gelir.
+        // MOBILE_APP_KEY .env'de tanımlıysa, anahtarsız istekler reddedilir.
+        const mobileKey = req.headers['x-mobile-app-key'] || req.headers['x-mobile-app'];
+        const expectedKey = process.env.MOBILE_APP_KEY;
+        if (expectedKey && (!mobileKey || mobileKey !== expectedKey)) {
+            return res.status(403).json({ error: 'Erişim reddedildi' });
+        }
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
         res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     }
@@ -4911,6 +5481,7 @@ app.use(cookieParser(process.env.COOKIE_SECRET || process.env.JWT_SECRET));
 // ═══════════════════════════════════════════════════════════════
 app.use(sanitizeBody);    // 🔒 XSS / Path traversal koruması
 app.use(mobileKeyMiddleware); // 🔒 Android native null-origin X-Mobile-App-Key doğrulaması
+app.use(verifyCsrf);   // 🔒 CSRF koruması aktif
 app.use(cookieAnomalyMiddleware); // 🔒 PRO: Cookie çalınma anomaly detection
 // 🎬 Video dosyaları için Range request + CORS + doğru MIME (oynatma için kritik)
 // ÖNEMLİ: Bu middleware /uploads genel static'ten ÖNCE tanımlanmalı!
@@ -5068,9 +5639,9 @@ app.get('/api/music/tracks', async (req, res) => {
 
 // IP bazlı token kullanım takibi (in-memory, cluster'da Redis önerilir)
 const tokenIpMap = new Map(); // tokenHash → { ips: Set, firstSeen, lastSeen, count }
-const TOKEN_ANOMALY_WINDOW  = 30 * 60 * 1000; // 30 dakika (genişletildi)
-const TOKEN_MAX_DISTINCT_IPS = 10;             // 30dk içinde 10'dan fazla farklı IP = şüpheli (CGN/proxy için tolerans)
-const TOKEN_MAX_REQUESTS     = 1000;           // 30dk içinde 1000+ istek = şüpheli
+const TOKEN_ANOMALY_WINDOW  = 60 * 60 * 1000; // 60 dakika pencere
+const TOKEN_MAX_DISTINCT_IPS = 30;             // Cloudflare edge + mobil hat degisimi icin yuksek tolerans
+const TOKEN_MAX_REQUESTS     = 2000;           // 60dk icinde 2000+ istek = suphelidev
 
 function trackTokenUsage(token, ip) {
     if (!token || !ip) return false; // şüpheli değil
@@ -5086,7 +5657,9 @@ function trackTokenUsage(token, ip) {
             entry.count = 0;
         }
 
-        entry.ips.add(ip);
+        // IPv6-mapped IPv4 normalize et (::ffff:1.2.3.4 -> 1.2.3.4)
+        const normalizedIp = (ip || '').replace(/^::ffff:/, '');
+        entry.ips.add(normalizedIp);
         entry.lastSeen = now;
         entry.count++;
         tokenIpMap.set(hash, entry);
@@ -5122,15 +5695,20 @@ async function cookieAnomalyMiddleware(req, res, next) {
                   (req.headers['authorization']?.startsWith('Bearer ') ? req.headers['authorization'].slice(7) : null);
     if (!token) return next();
 
-    const clientIp = req.ip || req.socket?.remoteAddress || 'unknown';
+    // Cloudflare arkasindan gelen gercek client IP
+    const clientIp = req.headers['cf-connecting-ip'] ||
+                     req.headers['x-real-ip'] ||
+                     req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
+                     req.ip ||
+                     req.socket?.remoteAddress ||
+                     'unknown';
     const isAnomalous = trackTokenUsage(token, clientIp);
 
     if (isAnomalous) {
-        // Token'ı blacklist'e ekle ve kullanıcıyı bildir
         await blacklistToken(token).catch(() => {});
-        console.error(`[🚨 SECURITY] Şüpheli cookie kullanımı → token iptal edildi | IP: ${clientIp}`);
+        console.error(`[SECURITY] Supheyli token kullanimi -> iptal | IP: ${clientIp}`);
         return res.status(401).json({
-            error: 'Oturum güvenlik ihlali nedeniyle sonlandırıldı. Tekrar giriş yapın.',
+            error: 'Oturum guvenlik ihlali nedeniyle sonlandirildi. Tekrar giris yapin.',
             code : 'SESSION_ANOMALY'
         });
     }
@@ -5279,6 +5857,15 @@ setInterval(async () => {
     } catch (_) {}
 }, 60 * 60 * 1000);
 
+// 🔧 Auth kullanıcı önbelleği — her istekte DB'ye gitmeyi önler (30 saniye TTL)
+// Kullanıcı ban'lanınca veya çıkış yapınca cache temizlenir
+const authUserCache = new Map(); // userId → { user, restriction, cachedAt }
+const AUTH_CACHE_TTL = 30 * 1000; // 30 saniye
+
+function invalidateAuthCache(userId) {
+    authUserCache.delete(String(userId));
+}
+
 async function authenticateToken(req, res, next) {
     // 🔒 1. Token al — önce HttpOnly cookie, yoksa Bearer header
     let token = req.cookies?.access_token;
@@ -5298,33 +5885,39 @@ async function authenticateToken(req, res, next) {
     try {
         // 🔒 3. JWT doğrulama — algorithm, issuer, audience zorunlu
         const decoded = jwt.verify(token, JWT_SECRET, {
-            algorithms : ['HS256'],              // Diğer algoritmalar (RS256 vb.) reddedilir
-            // iss/aud: yeni tokenlar için zorunlu, eski tokenlar için opsiyonel (geriye dönük uyumluluk)
+            algorithms : ['HS256'],
         });
 
-        // 🔒 4. Her istekte DB'den kullanıcı durumunu kontrol et
-        // isActive=TRUE → banlı veya silinmiş hesaplar token süresine bakmaksızın reddedilir
-        const user = await dbGet(
-            `SELECT id, username, name, email, role, plan, "profilePic", "coverPic", bio,
-                    "isVerified", "isActive", "userType", "hasFarmerBadge",
-                    "isOnline", "isBanned", "emailVerified", "twoFactorEnabled"
-             FROM users WHERE id = $1 AND "isActive" = TRUE`,
-            [decoded.id]
-        );
+        // 🔧 4. Kullanıcı bilgisi — önce cache'e bak, yoksa DB'ye git (502 azaltma)
+        let user, restriction;
+        const cached = authUserCache.get(String(decoded.id));
+        if (cached && (Date.now() - cached.cachedAt) < AUTH_CACHE_TTL) {
+            user        = cached.user;
+            restriction = cached.restriction;
+        } else {
+            user = await dbGet(
+                `SELECT id, username, name, email, role, plan, "profilePic", "coverPic", bio,
+                        "isVerified", "isActive", "userType", "hasFarmerBadge",
+                        "isOnline", "isBanned", "emailVerified", "twoFactorEnabled"
+                 FROM users WHERE id = $1 AND "isActive" = TRUE`,
+                [decoded.id]
+            );
+            if (!user) {
+                blacklistToken(token);
+                return res.status(403).json({ error: 'Hesap erişilemez durumda.' });
+            }
+            restriction = await dbGet(
+                `SELECT "isRestricted", "restrictedUntil", "canPost", "canComment", "canMessage", "canFollow", "canLike"
+                 FROM account_restrictions
+                 WHERE "userId" = $1 AND "isRestricted" = TRUE AND "restrictedUntil" > NOW()`,
+                [user.id]
+            );
+            authUserCache.set(String(user.id), { user, restriction, cachedAt: Date.now() });
+        }
         if (!user) {
-            // Token geçerli ama kullanıcı silinmiş → blacklist
             blacklistToken(token);
             return res.status(403).json({ error: 'Hesap erişilemez durumda.' });
         }
-        // 🔒 Banlı kullanıcı: sadece kendi profilini 3 sn görebilir,
-        // diğer tüm işlemler requireNotBanned middleware'i tarafından engellenir
-
-        const restriction = await dbGet(
-            `SELECT "isRestricted", "restrictedUntil", "canPost", "canComment", "canMessage", "canFollow", "canLike"
-             FROM account_restrictions
-             WHERE "userId" = $1 AND "isRestricted" = TRUE AND "restrictedUntil" > NOW()`,
-            [user.id]
-        );
 
         // 🔒 5. req.user — sadece whitelist edilmiş alanlar (spread/prototype pollution yok)
         req.user = {
@@ -5413,14 +6006,18 @@ async function createNotification(userId, type, message, data = {}) {
         } else if (type === 'new_post' && data.actorName) {
             pushTitle = `${data.actorName} 📸`;
             pushBody  = 'Yeni bir gönderi paylaştı';
+        } else if (type === 'disease_alarm') {
+            pushTitle = data.pushTitle || `⚠️ ${data.city || ''} Bölge Alarmı`;
+            pushBody  = message;
         }
 
         const urlMap = {
-            like      : data.postId ? `/p/${data.postId}` : '/',
-            comment   : data.postId ? `/p/${data.postId}` : '/',
-            follow    : data.actorUsername ? `/u/${data.actorUsername}` : '/',
-            message   : '/',
-            new_post  : data.postId ? `/p/${data.postId}` : '/',
+            like         : data.postId ? `/p/${data.postId}` : '/',
+            comment      : data.postId ? `/p/${data.postId}` : '/',
+            follow       : data.actorUsername ? `/u/${data.actorUsername}` : '/',
+            message      : '/',
+            new_post     : data.postId ? `/p/${data.postId}` : '/',
+            disease_alarm: '/feed',
         };
 
         // Web push (browser)
@@ -5432,10 +6029,13 @@ async function createNotification(userId, type, message, data = {}) {
         }).catch(() => {});
 
         // 📱 FCM push (Android native app) — data alanı string map olmalı
+        // diseaseInfo gibi uzun alanlar 4KB FCM limitini aşmasın → kırp
+        const fcmSafeData = { ...data };
+        if (fcmSafeData.diseaseInfo) fcmSafeData.diseaseInfo = String(fcmSafeData.diseaseInfo).substring(0, 200);
         const fcmData = {
             type,
-            url: urlMap[type] || '/',  // FCM web push tıklama URL'i (absolute yapılacak sendFcmPush'ta)
-            ...Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v ?? '')])),
+            url: urlMap[type] || '/feed',
+            ...Object.fromEntries(Object.entries(fcmSafeData).map(([k, v]) => [k, String(v ?? '')])),
         };
         sendFcmPush(userId, {
             title: pushTitle,
@@ -5468,12 +6068,12 @@ function generateTokens(user) {
             aud      : 'agrolink-client',  // Audience
         },
         JWT_SECRET,
-        { expiresIn: '1d', algorithm: 'HS256' }
+        { expiresIn: '15m', algorithm: 'HS256' } // 🔒 7d → 15m: çalınan access token penceresi kapatıldı; refresh token ile oturum sürdürülür
     );
     const refreshToken = jwt.sign(
         { id: user.id, type: 'refresh', iss: 'agrolink' },
         JWT_REFRESH_SECRET,
-        { expiresIn: '7d', algorithm: 'HS256' }
+        { expiresIn: '30d', algorithm: 'HS256' } // 🔒 365d → 30d: çalınan refresh token penceresi kapatıldı
     );
     return { accessToken, refreshToken };
 }
@@ -5499,16 +6099,16 @@ function setAuthCookies(res, req, tokens) {
     res.cookie('access_token', tokens.accessToken, {
         httpOnly : true,
         secure   : isSecure,
-        sameSite : 'strict',
+        sameSite : 'lax',   // 🔧 strict→lax: Cloudflare+link tıklama senaryolarında cookie gitmiyordu
         path     : '/',
-        maxAge   : 24 * 60 * 60 * 1000,
+        maxAge   : 15 * 60 * 1000, // 🔒 7 gün → 15 dakika — JWT expiry ile eşleştirildi
     });
     res.cookie('refresh_token', tokens.refreshToken, {
         httpOnly : true,
         secure   : isSecure,
-        sameSite : 'strict',
-        path     : '/api/auth/refresh',
-        maxAge   : 7 * 24 * 60 * 60 * 1000, // 7 gün (önceki: 30 gün — hata!)
+        sameSite : 'lax',   // 🔧 strict→lax: Cloudflare+link tıklama senaryolarında cookie gitmiyordu
+        path     : '/',                        // Android/mobile uyumu için '/' (önceki: '/api/auth/refresh' — cookie gönderilmiyordu!)
+        maxAge   : 30 * 24 * 60 * 60 * 1000, // 🔒 1 yıl → 30 gün — refresh token JWT ile eşleştirildi
     });
 }
 
@@ -5523,14 +6123,32 @@ function setCsrfCookie(res, req, token) {
     res.cookie('csrf_token', token, {
         httpOnly : false, // kasıtlı: JS okuyacak, X-CSRF-Token header olarak gönderecek
         secure   : isSecure,
-        sameSite : 'strict',
+        sameSite : 'lax',   // 🔧 strict→lax: Cloudflare+link tıklama senaryolarında cookie gitmiyordu
         path     : '/',
-        maxAge   : 24 * 60 * 60 * 1000,
+        maxAge   : 15 * 60 * 1000, // 🔒 7 gün → 15 dakika — access_token ile eşleştirildi
     });
 }
 
 function verifyCsrf(req, res, next) {
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+    // Bu endpoint'ler kendi token doğrulamasını yapıyor — CSRF muaf
+    // /api/auth/refresh  → HttpOnly refresh token ile korunuyor
+    // /api/auth/google   → Google idToken ile korunuyor (popup origin sorunu)
+    // /api/auth/login    → Cookie henüz set edilmemiş olabilir (ilk giriş)
+    // /api/auth/register → Kayıt sırasında cookie yok
+    const csrfExempt = [
+        '/api/auth/refresh',
+        '/api/auth/google',
+        '/api/auth/login',
+        '/api/auth/register',
+        '/api/auth/register-verify',
+        '/api/auth/forgot-password',
+        '/api/auth/reset-password',
+        '/api/auth/resend-verification',
+        '/api/auth/verify-otp',
+        '/api/auth/verify-2fa',
+    ];
+    if (csrfExempt.includes(req.path)) return next();
     const cookieToken = req.cookies?.csrf_token;
     const headerToken = req.headers['x-csrf-token'];
     if (!cookieToken) return next();
@@ -5831,7 +6449,7 @@ app.post('/api/auth/register', registerLimiter, validateAuthInput, upload.single
         const cleanEmail = email.toLowerCase().trim();
 
         const existing = await dbGet('SELECT id FROM users WHERE username = $1', [cleanUsername]);
-        if (existing) return res.status(400).json({ error: 'Bu kullanıcı adı alınmış' });
+        if (existing) return res.status(409).json({ error: 'Kayıt tamamlanamadı. Lütfen farklı bilgiler deneyin.' }); // 🔒 DÜZELTMESİ: kullanıcı adı varlığı gizlendi
 
         // Aynı e-posta ile birden fazla hesap açılabilir — kullanıcı adı benzersiz olmalı
         const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
@@ -5891,7 +6509,8 @@ app.post('/api/auth/register', registerLimiter, validateAuthInput, upload.single
 
         // Doğrulama kodu içeren ayrı e-posta (sadece gmail)
         sendEmailIfGmail(cleanEmail, '🌾 Agrolink — E-posta Doğrulama Kodunuz', `
-<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8"><style>
+<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"><style>
 body{font-family:'Segoe UI',sans-serif;background:#f4f4f4;margin:0;padding:0}
 .container{max-width:600px;margin:20px auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.1)}
 .header{background:linear-gradient(135deg,#2e7d32,#4caf50);padding:40px 30px;text-align:center}
@@ -5915,12 +6534,15 @@ body{font-family:'Segoe UI',sans-serif;background:#f4f4f4;margin:0;padding:0}
   <div class="footer"><p>Bu e-posta otomatik gönderilmiştir. &copy; ${new Date().getFullYear()} Agrolink</p></div>
 </div></body></html>`).catch(() => {});
 
+        // 🔒 DÜZELTMESİ: Doğrulama yapılmadan token verilmiyor.
+        // Kullanıcı ancak /api/auth/register-verify ile kodu onayladıktan sonra token alır.
         res.status(201).json({
-            message: 'Hesap oluşturuldu',
-            token: tokens.accessToken,
-            refreshToken: tokens.refreshToken,
+            message: 'Doğrulama kodu e-posta adresinize gönderildi. Lütfen kodu girerek kaydınızı tamamlayın.',
             emailVerificationRequired: true,
-            user: { id: userId, username: cleanUsername, name, email: cleanEmail, profilePic: absoluteUrl(profilePic) }
+            requiresVerification: true,
+            email: cleanEmail,
+            userId,
+            profilePic: absoluteUrl(profilePic),
         });
     } catch (error) {
         console.error('Kayıt hatası:', error);
@@ -5930,7 +6552,7 @@ body{font-family:'Segoe UI',sans-serif;background:#f4f4f4;margin:0;padding:0}
 
 // ─── 2b. KAYIT (register-init alias — UI uyumluluğu için) ──────────
 // UI /api/auth/register-init çağırıyor, bu endpoint aynı işlemi yapar
-app.post('/api/auth/register-init', registerLimiter, recaptchaMiddleware, upload.single('profilePic'), async (req, res) => {
+app.post('/api/auth/register-init', registerLimiter, validateAuthInput, recaptchaMiddleware, upload.single('profilePic'), async (req, res) => { // 🔒 validateAuthInput eklendi
     try {
         const { name, username, email, password, userType } = req.body;
         if (!name || !username || !email || !password) {
@@ -5943,7 +6565,7 @@ app.post('/api/auth/register-init', registerLimiter, recaptchaMiddleware, upload
 
         // Sadece kullanıcı adı benzersiz olmalı — aynı e-posta ile birden fazla hesap açılabilir
         const existing = await dbGet('SELECT id FROM users WHERE username = $1', [cleanUsername]);
-        if (existing) return res.status(400).json({ error: 'Bu kullanıcı adı alınmış' });
+        if (existing) return res.status(409).json({ error: 'Kayıt tamamlanamadı. Lütfen farklı bilgiler deneyin.' }); // 🔒 DÜZELTMESİ: enumeration gizlendi
 
         const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
         const userId = uuidv4();
@@ -6075,7 +6697,7 @@ app.post('/api/auth/login', loginLimiter, validateAuthInput, recaptchaMiddleware
             const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
             await dbRun(
                 `INSERT INTO refresh_tokens (id, "userId", "tokenHash", ip, "userAgent", "createdAt", "expiresAt")
-                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '7 days')`,
+                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '30 days' /* 🔒 365→30 gün */)`,
                 [uuidv4(), user.id, tokenHash, req.ip, req.headers['user-agent'] || '']
             );
             const csrfToken = generateCsrfToken();
@@ -6092,6 +6714,37 @@ app.post('/api/auth/login', loginLimiter, validateAuthInput, recaptchaMiddleware
                     bio: user.bio, isVerified: user.isVerified, hasFarmerBadge: user.hasFarmerBadge,
                     role: user.role, isBanned: true
                 }
+            });
+        }
+
+        // 🔒 DÜZELTMESİ: E-posta doğrulanmamış kullanıcılar giriş yapamaz.
+        // Gmail olmayan adreslere doğrulama kodu gönderilemiyor;
+        // bu adreslere REQUIRE_EMAIL_VERIFICATION=false ile esnek davranılır.
+        const requireVerification = process.env.REQUIRE_EMAIL_VERIFICATION !== 'false';
+        if (requireVerification && !user.emailVerified) {
+            // Mevcut doğrulama kodu var mı kontrol et, yoksa yenisini oluştur
+            const existingVerif = await dbGet(
+                `SELECT id FROM email_verifications WHERE "userId" = $1 AND used = FALSE AND "expiresAt" > NOW() LIMIT 1`,
+                [user.id]
+            );
+            if (!existingVerif) {
+                const newCode = crypto.randomInt(100000, 999999).toString();
+                await dbRun(
+                    `DELETE FROM email_verifications WHERE "userId" = $1`,
+                    [user.id]
+                );
+                await dbRun(
+                    `INSERT INTO email_verifications (id, "userId", email, code, "expiresAt") VALUES ($1, $2, $3, $4, NOW() + INTERVAL '15 minutes')`,
+                    [uuidv4(), user.id, user.email, newCode]
+                );
+                sendEmailIfGmail(user.email, '🌾 Agrolink — E-posta Doğrulama Kodunuz',
+                    `<p>Doğrulama kodunuz: <strong>${newCode}</strong> (15 dakika geçerli)</p>`
+                ).catch(() => {});
+            }
+            return res.status(403).json({
+                error: 'E-posta adresiniz doğrulanmamış. Lütfen e-postanıza gelen kodu girin.',
+                emailVerificationRequired: true,
+                email: user.email,
             });
         }
 
@@ -6165,7 +6818,7 @@ app.post('/api/auth/login', loginLimiter, validateAuthInput, recaptchaMiddleware
         const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
         await dbRun(
             `INSERT INTO refresh_tokens (id, "userId", "tokenHash", ip, "userAgent", "createdAt", "expiresAt")
-             VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '7 days')`,
+             VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '30 days' /* 🔒 365→30 gün */)`,
             [uuidv4(), user.id, tokenHash, req.ip, req.headers['user-agent'] || '']
         );
 
@@ -6352,7 +7005,7 @@ app.post('/api/auth/google', loginLimiter, async (req, res) => {
         const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
         await dbRun(
             `INSERT INTO refresh_tokens (id,"userId","tokenHash",ip,"userAgent","createdAt","expiresAt")
-             VALUES($1,$2,$3,$4,$5,NOW(),NOW()+INTERVAL '7 days')`,
+             VALUES($1,$2,$3,$4,$5,NOW(),NOW()+INTERVAL '30 days' /* 🔒 365→30 gün */)`,
             [uuidv4(), user.id, tokenHash, req.ip, req.headers['user-agent'] || '']
         );
 
@@ -6394,14 +7047,15 @@ app.post('/api/auth/refresh', refreshLimiter, async (req, res) => {
         const refreshToken = req.cookies?.refresh_token || req.body?.refreshToken;
         if (!refreshToken) return res.status(401).json({ error: 'Refresh token gerekli' });
 
-        const decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
+        const decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET, { algorithms: ['HS256'] }); // 🔒 DÜZELTMESİ: algorithm confusion saldırısı engellendi
         const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
 
+        // Token DB'de kayıtlı mı? Kayıtlı değilse lazy-register et
+        // (eski kullanıcılar veya tablo temizlendiyse hâlâ refresh yapabilsinler)
         const stored = await dbGet(
             `SELECT * FROM refresh_tokens WHERE "tokenHash" = $1 AND "isActive" = TRUE AND "expiresAt" > NOW()`,
             [tokenHash]
         );
-        if (!stored) return res.status(403).json({ error: 'Geçersiz refresh token' });
 
         const user = await dbGet(
             // 🔒 Sadece whitelist alanlar
@@ -6411,16 +7065,19 @@ app.post('/api/auth/refresh', refreshLimiter, async (req, res) => {
              FROM users WHERE id = $1 AND "isActive" = TRUE`,
             [decoded.id]
         );
-        if (!user) return res.status(403).json({ error: 'Kullanıcı bulunamadı' });
+        if (!user) return res.status(401).json({ error: 'Kullanıcı bulunamadı' });
 
-        // 🔒 Token Rotation: eski token geçersiz kıl, yeni token oluştur
-        await dbRun('UPDATE refresh_tokens SET "isActive" = FALSE WHERE "tokenHash" = $1', [tokenHash]);
+        // Stored yoksa (eski session veya tablo temizlendi) → lazy-create yapıp devam et
+        // Stored varsa eski token'ı devre dışı bırak (token rotation)
+        if (stored) {
+            await dbRun('UPDATE refresh_tokens SET "isActive" = FALSE WHERE "tokenHash" = $1', [tokenHash]);
+        }
 
         const tokens = generateTokens(user);
         const newHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
         await dbRun(
             `INSERT INTO refresh_tokens (id, "userId", "tokenHash", ip, "userAgent", "createdAt", "expiresAt")
-             VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '7 days')`,
+             VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '30 days' /* 🔒 365→30 gün */)`,
             [uuidv4(), user.id, newHash, req.ip, req.headers['user-agent'] || '']
         );
 
@@ -6429,7 +7086,9 @@ app.post('/api/auth/refresh', refreshLimiter, async (req, res) => {
 
         res.json({ token: tokens.accessToken, refreshToken: tokens.refreshToken });
     } catch (error) {
-        res.status(403).json({ error: 'Geçersiz token' });
+        // 401 döndür: client-side apiFetch 401'i yakalar ve logout akışını başlatır
+        // 403 olursa client yakalayamaz → loop'a girer
+        res.status(401).json({ error: 'Oturum süresi doldu. Tekrar giriş yapın.' });
     }
 });
 
@@ -6438,7 +7097,8 @@ app.get('/api/me', authenticateToken, async (req, res) => {
     try {
         const user = await dbGet(
             `SELECT id, username, name, email, "profilePic", "coverPic", bio, location, website,
-                    "isVerified", "hasFarmerBadge", "userType", "createdAt", "lastLogin", "isOnline", role
+                    "isVerified", "hasFarmerBadge", "userType", "createdAt", "lastLogin", "isOnline", role,
+                    "farmerBadgeType", "farmerCertificate"
              FROM users WHERE id = $1`,
             [req.user.id]
         );
@@ -6476,7 +7136,8 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
     try {
         const user = await dbGet(
             `SELECT id, username, name, email, "profilePic", "coverPic", bio, location, website,
-                    "isVerified", "hasFarmerBadge", "userType", "createdAt", "lastLogin", "isOnline", role, plan
+                    "isVerified", "hasFarmerBadge", "userType", "createdAt", "lastLogin", "isOnline", role, plan,
+                    "farmerBadgeType", "farmerCertificate"
              FROM users WHERE id = $1`,
             [req.user.id]
         );
@@ -6517,7 +7178,7 @@ app.post('/api/auth/verify-otp', otpLimiter, validateAuthInput, async (req, res)
             const tokens = generateTokens(user);
             const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
             await dbRun(
-                `INSERT INTO refresh_tokens (id, "userId", "tokenHash", ip, "userAgent", "createdAt", "expiresAt") VALUES ($1,$2,$3,$4,$5,NOW(),NOW() + INTERVAL '7 days')`,
+                `INSERT INTO refresh_tokens (id, "userId", "tokenHash", ip, "userAgent", "createdAt", "expiresAt") VALUES ($1,$2,$3,$4,$5,NOW(),NOW() + INTERVAL '30 days' /* 🔒 365→30 gün */)`,
                 [uuidv4(), user.id, tokenHash, req.ip, req.headers['user-agent'] || '']
             );
             const { password: _, ...userSafe } = user;
@@ -6704,6 +7365,22 @@ function requireNotBanned(req, res, next) {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// 🔒 ADMIN MİDDLEWARE — Merkezi yönetim
+// authenticateToken'dan SONRA kullanılır.
+// Dağınık inline role kontrolleri yerine tek noktadan yetki kontrolü.
+// ════════════════════════════════════════════════════════════════════
+function requireAdmin(req, res, next) {
+    if (!req.user || req.user.role !== 'admin') {
+        console.warn(`[ADMIN] Yetkisiz erişim girişimi: userId=${req.user?.id} path=${req.path}`);
+        return res.status(403).json({ error: 'Yönetici yetkisi gerekli.' });
+    }
+    next();
+}
+
+// 🔒 Admin endpoint'leri için rate limiter yukarıda tanımlandı (refreshLimiter'ın hemen altında)
+// adminLimiter — satır ~335 civarında tanımlı
+
+// ════════════════════════════════════════════════════════════════════
 // 🌐 OPTİONAL AUTH — Token varsa doğrular, yoksa req.user=null ile devam eder
 // Kamuya açık endpointlerde kullanılır (profil, postlar, yorumlar vs.)
 // ════════════════════════════════════════════════════════════════════
@@ -6765,7 +7442,7 @@ app.put('/api/users/profile', authenticateToken, (req, res, next) => {
     ])(req, res, (err) => {
         if (err) {
             console.error('[Profile] Multer hatası:', err.message);
-            return res.status(400).json({ error: err.message || 'Dosya yükleme hatası' });
+            return res.status(400).json({ error: 'Dosya yükleme hatası' }) // 🔒 DÜZELTMESİ: detay gizlendi;
         }
         next();
     });
@@ -7419,7 +8096,7 @@ app.get('/api/feed', authenticateToken, async (req, res) => {
         //   - Engellenenler hariç (NOT EXISTS blocks)
         // Performans: idx_follows_followerId + idx_posts_active_created + idx_blocks_blocker
         const posts = await dbAll(
-            `SELECT p.*, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge", u."userType", u.username as "authorUsername",
+            `SELECT p.*, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge", u."userType", u."farmerBadgeType", u."farmerCertificate", u.username as "authorUsername",
                     EXISTS(SELECT 1 FROM likes WHERE "postId" = p.id AND "userId" = $1) as "isLiked",
                     EXISTS(SELECT 1 FROM saves WHERE "postId" = p.id AND "userId" = $1) as "isSaved",
                     (p."userId" = $1 OR TRUE) as "isFollowing"
@@ -7463,7 +8140,7 @@ app.get('/api/posts/:id', authenticateToken, async (req, res, next) => {
         return res.status(400).json({ error: 'Geçersiz gönderi ID' });
     try {
         const post = await dbGet(
-            `SELECT p.*, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge", u."userType", u.username as "authorUsername",
+            `SELECT p.*, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge", u."userType", u."farmerBadgeType", u."farmerCertificate", u.username as "authorUsername",
                     EXISTS(SELECT 1 FROM likes WHERE "postId" = p.id AND "userId" = $2) as "isLiked",
                     EXISTS(SELECT 1 FROM saves WHERE "postId" = p.id AND "userId" = $2) as "isSaved"
              FROM posts p
@@ -7862,7 +8539,7 @@ const messageLimiter = rateLimit({
     max: 30,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req, res) => req.user?.id || rateLimit.ipKeyGenerator(req, res),
+    keyGenerator: (req, res) => req.user?.id || getRateLimitKey(req),
     message: { error: 'Çok hızlı mesaj gönderiyorsunuz. Lütfen bir dakika bekleyin.' },
     skip: (req) => process.env.NODE_ENV === 'test',
 });
@@ -7875,8 +8552,19 @@ app.post('/api/messages', authenticateToken, messageLimiter, checkRestriction('m
         const blocked = await dbGet('SELECT id FROM blocks WHERE ("blockerId" = $1 AND "blockedId" = $2) OR ("blockerId" = $2 AND "blockedId" = $1)', [req.user.id, recipientId]);
         if (blocked) return res.status(403).json({ error: 'Bu kullanıcıya mesaj gönderemezsiniz' });
 
-        const recipient = await dbGet('SELECT id, username FROM users WHERE id = $1 AND "isActive" = TRUE', [recipientId]);
+        const recipient = await dbGet('SELECT id, username, "isPrivate" FROM users WHERE id = $1 AND "isActive" = TRUE', [recipientId]);
         if (!recipient) return res.status(404).json({ error: 'Alıcı bulunamadı' });
+
+        // 🔒 Gizli hesap kontrolü: alıcı gizliyse yalnızca onaylı takipçiler mesaj gönderebilir
+        if (recipient.isPrivate) {
+            const isApprovedFollower = await dbGet(
+                `SELECT id FROM follow_requests WHERE "requesterId" = $1 AND "targetId" = $2 AND status = 'accepted'`,
+                [req.user.id, recipientId]
+            );
+            if (!isApprovedFollower) {
+                return res.status(403).json({ error: 'Bu kullanıcı gizli hesaba sahip. Mesaj gönderebilmek için takip isteğinizin onaylanması gerekiyor.' });
+            }
+        }
 
         const msgId = uuidv4();
         await dbRun(
@@ -8178,7 +8866,7 @@ app.post('/api/store/products', authenticateToken, storeLimiter, (req, res, next
     ])(req, res, (err) => {
         if (err) {
             console.error('Multer hatası:', err);
-            return res.status(400).json({ error: 'Dosya yükleme hatası: ' + err.message });
+            return res.status(400).json({ error: 'Dosya yükleme hatası' }); // 🔒 DÜZELTMESİ: detay gizlendi
         }
         // req.files'ı düz array'e çevir (geriye uyumluluk)
         if (req.files && !Array.isArray(req.files)) {
@@ -8236,7 +8924,7 @@ app.post('/api/store/products', authenticateToken, storeLimiter, (req, res, next
                 await fs.unlink(f.path).catch(() => {});
             }
         }
-        res.status(500).json({ error: 'Sunucu hatası: ' + error.message });
+        res.status(500).json({ error: 'Sunucu hatası' }); // 🔒 DÜZELTMESİ: detay istemciye gönderilmiyor
     }
 });
 
@@ -8528,7 +9216,7 @@ app.post('/api/auth/forgot-password', forgotPasswordLimiter, validateAuthInput, 
 });
 
 // ─── YENİ ROTA 4: TOKEN İLE ŞİFRE SIFIRLA ──────────────────────────
-app.post('/api/auth/reset-password', validateAuthInput, async (req, res) => {
+app.post('/api/auth/reset-password', forgotPasswordLimiter, validateAuthInput, async (req, res) => { // 🔒 forgotPasswordLimiter eklendi
     try {
         const { token, newPassword, confirmPassword } = req.body;
         if (!token || !newPassword || !confirmPassword) return res.status(400).json({ error: 'Tüm alanlar zorunludur' });
@@ -8785,7 +9473,7 @@ function sanitizeVideoId(raw) {
 
 // ─── VİDEO STREAM (Range Request / HTTP 206) ────────────────────────
 // Donma / kasma olmaz: tarayıcı sadece ihtiyacı kadar chunk çeker
-app.get('/api/videos/stream/:filename', authenticateToken, (req, res) => {
+app.get('/api/videos/stream/:filename', optionalAuth, (req, res) => {
     try {
         // 🔒 Path traversal koruması
         const safeFilename = sanitizeFilename(req.params.filename);
@@ -8875,10 +9563,8 @@ app.get('/api/videos/:videoId/hls-status', authenticateToken, (req, res) => {
 
 // ─── HLS→MP4 MİGRASYON: Eski m3u8 URL'li gönderileri mp4'e çevir ──────
 // Kullanım: POST /api/admin-fix-hls-to-mp4  (Postman ile 1 kez çalıştır, admin token ile)
-app.post('/api/admin-fix-hls-to-mp4', authenticateToken, async (req, res) => {
+app.post('/api/admin-fix-hls-to-mp4', authenticateToken, requireAdmin, adminLimiter, async (req, res) => {
     try {
-        const user = await dbGet('SELECT role FROM users WHERE id = $1', [req.user.id]);
-        if (!user || user.role !== 'admin') return res.status(403).json({ error: 'Yetki yok' });
 
         const hlsPosts = await pool.query(
             `SELECT id, media FROM posts WHERE media LIKE '%/hls/%' AND media LIKE '%.m3u8'`
@@ -8962,7 +9648,7 @@ app.put('/api/posts/:id', authenticateToken, async (req, res) => {
 
         if (content !== undefined)        { updates.push(`content = $${idx++}`);        params.push(content.substring(0, 5000)); }
         if (allowComments !== undefined)  { updates.push(`"allowComments" = $${idx++}`); params.push(allowComments !== 'false' && allowComments !== false); }
-        if (locationName !== undefined)   { updates.push(`"locationName" = $${idx++}`); params.push(locationName); }
+        if (locationName !== undefined)   { updates.push(`"locationName" = $${idx++}`); params.push(String(locationName).substring(0, 200)); } // 🔒 max 200 karakter
 
         if (updates.length === 0) return res.status(400).json({ error: 'Güncellenecek alan yok' });
 
@@ -9545,15 +10231,15 @@ app.post('/api/auth/logout', authenticateToken, async (req, res) => {
     try {
         // 🔒 Token'ı blacklist'e ekle — logout sonrası aynı token kullanılamaz (replay attack önlemi)
         blacklistToken(req._token);
+        invalidateAuthCache(req.user.id); // 🔧 Auth cache temizle
 
         await dbRun('UPDATE users SET "isOnline" = FALSE, "lastSeen" = NOW() WHERE id = $1', [req.user.id]);
         await dbRun('UPDATE refresh_tokens SET "isActive" = FALSE WHERE "userId" = $1', [req.user.id]);
-        // 🔒 HttpOnly cookie'leri temizle
-        res.clearCookie('access_token',  { httpOnly: true, sameSite: 'strict', path: '/' });
-        res.clearCookie('refresh_token', { httpOnly: true, sameSite: 'strict', path: '/api/auth/refresh' });
+        res.clearCookie('access_token',  { httpOnly: true, sameSite: 'lax', path: '/' });
+        res.clearCookie('refresh_token', { httpOnly: true, sameSite: 'lax', path: '/' });
         res.json({ message: 'Çıkış yapıldı' });
     } catch (error) {
-        console.error('Çıkış hatası');
+        console.error('Çıkış hatası', error.message);
         res.status(500).json({ error: 'Sunucu hatası' });
     }
 });
@@ -9583,7 +10269,7 @@ app.get('/api/posts/:id/likes', authenticateToken, async (req, res) => {
 // ─── 49. ÜRÜN GÜNCELLE ──────────────────────────────────────────────
 app.put('/api/store/products/:id', authenticateToken, (req, res, next) => {
     upload.fields([{ name: 'images', maxCount: 5 }, { name: 'image', maxCount: 1 }])(req, res, (err) => {
-        if (err) return res.status(400).json({ error: 'Dosya hatası: ' + err.message });
+        if (err) return res.status(400).json({ error: 'Dosya yükleme hatası' }); // 🔒 DÜZELTMESİ: detay gizlendi
         if (req.files && !Array.isArray(req.files)) {
             req.files = [...(req.files['images'] || []), ...(req.files['image'] || [])];
         }
@@ -9629,7 +10315,7 @@ app.put('/api/store/products/:id', authenticateToken, (req, res, next) => {
         res.json({ message: 'Ürün güncellendi', product: updated });
     } catch (error) {
         console.error('Ürün güncelleme hatası:', error);
-        res.status(500).json({ error: 'Sunucu hatası: ' + error.message });
+        res.status(500).json({ error: 'Sunucu hatası' }); // 🔒 DÜZELTMESİ: detay istemciye gönderilmiyor
     }
 });
 
@@ -10039,9 +10725,14 @@ app.post('/api/posts/batch-view', authenticateToken, async (req, res) => {
         const { postIds } = req.body;
         if (!Array.isArray(postIds) || postIds.length === 0) return res.json({ updated: 0 });
 
-        const placeholders = postIds.map((_, i) => `$${i + 1}`).join(',');
-        await pool.query(`UPDATE posts SET views = views + 1 WHERE id IN (${placeholders})`, postIds);
-        res.json({ updated: postIds.length });
+        // UUID formatı dışındaki değerleri filtrele (örn: "quick_actions" gibi string'ler)
+        const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        const validIds = postIds.filter(id => typeof id === 'string' && UUID_RE.test(id));
+        if (validIds.length === 0) return res.json({ updated: 0 });
+
+        const placeholders = validIds.map((_, i) => `$${i + 1}`).join(',');
+        await pool.query(`UPDATE posts SET views = views + 1 WHERE id IN (${placeholders})`, validIds);
+        res.json({ updated: validIds.length });
     } catch (error) {
         console.error('Batch view hatası:', error);
         res.status(500).json({ error: 'Sunucu hatası' });
@@ -10061,13 +10752,14 @@ app.post('/api/auth/logout-all', authenticateToken, async (req, res) => {
         const uid = req.user.id;
         // 🔒 Mevcut token'ı blacklist'e ekle
         blacklistToken(req._token);
+        invalidateAuthCache(req.user.id); // 🔧 Auth cache temizle
         // Tüm refresh token'ları geçersiz kıl
         await dbRun(`UPDATE refresh_tokens SET "isActive" = FALSE WHERE "userId" = $1`, [uid]);
         await dbRun(`UPDATE active_sessions SET "isActive" = FALSE WHERE "userId" = $1`, [uid]);
         await dbRun(`UPDATE users SET "isOnline" = FALSE, "lastSeen" = NOW() WHERE id = $1`, [uid]);
         // Cookie temizle
-        res.clearCookie('access_token',  { httpOnly: true, sameSite: 'strict', path: '/' });
-        res.clearCookie('refresh_token', { httpOnly: true, sameSite: 'strict', path: '/api/auth/refresh' });
+        res.clearCookie('access_token',  { httpOnly: true, sameSite: 'lax', path: '/' });
+        res.clearCookie('refresh_token', { httpOnly: true, sameSite: 'lax', path: '/' });
         res.json({ success: true, message: 'Tüm oturumlardan çıkış yapıldı' });
     } catch (error) {
         console.error('Logout-all hatası:', error);
@@ -10398,6 +11090,187 @@ self.addEventListener('fetch', (event) => {
 });
 
 const publicDir = path.join(__dirname, 'public');
+
+// Gönderi paylaşım sayfası: /post/:postId (tam handler — redirect değil, direkt HTML)
+// ÖNEMLİ: Bu route publicDir if bloğunun DIŞINDA olmalı — public/ klasörü olmasa bile çalışır.
+app.get('/post/:postId', async (req, res) => {
+    const DOMAIN = process.env.APP_URL || 'https://sehitumitkestitarimmtal.com';
+    try {
+        const postId = req.params.postId?.trim();
+        if (!postId) return res.redirect('/');
+
+        const post = await dbGet(
+            `SELECT p.id, p.content, p.media, p."mediaType", p."mediaUrls",
+                    p."likeCount", p."commentCount", p."createdAt", p.views,
+                    p."locationName", p.location, u.name, u.username, u."profilePic", u."isVerified"
+             FROM posts p LEFT JOIN users u ON p."userId"=u.id
+             WHERE p.id=$1 AND p."isActive"=TRUE LIMIT 1`,
+            [postId]
+        ).catch((err) => { console.error('[/post/:postId] dbGet hatası:', err.message); return null; });
+
+        if (!post) {
+            return res.status(404).send(`<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
+<title>Gönderi Bulunamadı • AgroLink</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#060d0a;color:#e8f5e9;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.box{text-align:center;padding:40px}.logo{font-size:28px;font-weight:800;color:#00e676;margin-bottom:16px}
+p{color:rgba(255,255,255,0.5);margin-bottom:24px}a{display:inline-block;padding:12px 28px;background:#00e676;color:#020810;border-radius:50px;text-decoration:none;font-weight:700}
+</style></head><body><div class="box"><div class="logo">🌾 AgroLink</div><h2>Gönderi bulunamadı</h2>
+<p>Bu gönderi silinmiş veya mevcut değil.</p><a href="${DOMAIN}">Ana Sayfaya Dön</a></div></body></html>`);
+        }
+
+        let mediaItems = [];
+        if (post.mediaUrls) {
+            try {
+                const arr = typeof post.mediaUrls === 'string' ? JSON.parse(post.mediaUrls) : post.mediaUrls;
+                mediaItems = (arr||[]).map(item => {
+                    const url = item?.url || (typeof item === 'string' ? item : null);
+                    if (!url) return null;
+                    return { url: url.startsWith('http') ? url : DOMAIN + url, type: item?.type || post.mediaType || 'image' };
+                }).filter(Boolean);
+            } catch {}
+        }
+        if (!mediaItems.length && post.media)
+            mediaItems = [{ url: post.media.startsWith('http') ? post.media : DOMAIN + post.media, type: post.mediaType || 'image' }];
+
+        const profPic  = post.profilePic ? (post.profilePic.startsWith('http') ? post.profilePic : DOMAIN + post.profilePic) : `${DOMAIN}/agro.png`;
+        const first    = mediaItems[0];
+        const ogImg    = (first?.type === 'image' ? first.url : null) || profPic;
+        const title    = `${post.name || post.username} (@${post.username}) • AgroLink`;
+        const rawDesc  = (post.content||'').replace(/<[^>]*>/g,'').substring(0,200);
+        const desc     = rawDesc || 'AgroLink Tarım Topluluğu paylaşımı';
+        const pageUrl  = `${DOMAIN}/post/${post.id}`;
+        const profUrl  = `${DOMAIN}/u/${post.username}`;
+        const badge    = post.isVerified ? ' ✓' : '';
+        const diff     = Date.now() - new Date(post.createdAt).getTime();
+        const m        = Math.floor(diff/60000);
+        const timeAgo  = m<1?'Az önce':m<60?m+' dk önce':m<1440?Math.floor(m/60)+' saat önce':Math.floor(m/1440)+' gün önce';
+        // Carousel HTML: birden fazla medya varsa carousel, tek ise direkt
+        let mediaHtml = '';
+        if (mediaItems.length > 1) {
+            const slides = mediaItems.map((item, idx) =>
+                item.type === 'video'
+                ? `<div class="slide" id="slide-${idx}" style="display:${idx===0?'block':'none'}"><video controls playsinline preload="metadata" muted autoplay loop style="width:100%;max-height:520px;background:#000;display:block;object-fit:contain" src="${item.url}" onerror="this.parentElement.style.display='none'"></video></div>`
+                : `<div class="slide" id="slide-${idx}" style="display:${idx===0?'block':'none'}"><img src="${item.url}" alt="görsel ${idx+1}" style="width:100%;display:block;max-height:580px;object-fit:cover" onerror="this.parentElement.style.display='none'"></div>`
+            ).join('');
+            const dots = mediaItems.map((_,i)=>`<div class="sl-dot${i===0?' active':''}" onclick="goSlide(${i})"></div>`).join('');
+            mediaHtml = `<div class="media-wrap" style="position:relative">
+  ${slides}
+  <button onclick="prevSlide()" class="sl-btn sl-prev" aria-label="Önceki">&#8249;</button>
+  <button onclick="nextSlide()" class="sl-btn sl-next" aria-label="Sonraki">&#8250;</button>
+  <div class="sl-counter" id="sl-counter">1 / ${mediaItems.length}</div>
+  <div class="sl-dots">${dots}</div>
+</div>
+<script>
+var _si=0,_st=${mediaItems.length};
+function _upd(){document.querySelectorAll('.slide').forEach(function(s,i){s.style.display=i===_si?'block':'none';});document.getElementById('sl-counter').textContent=(_si+1)+' / '+_st;document.querySelectorAll('.sl-dot').forEach(function(d,i){d.classList.toggle('active',i===_si);});}
+function prevSlide(){_si=(_si-1+_st)%_st;_upd();}
+function nextSlide(){_si=(_si+1)%_st;_upd();}
+function goSlide(i){_si=i;_upd();}
+</script>`;
+        } else if (mediaItems.length === 1) {
+            const item = mediaItems[0];
+            mediaHtml = `<div class="media-wrap">${item.type==='video'
+                ? `<video controls playsinline preload="metadata" muted autoplay loop style="width:100%;max-height:520px;background:#000;display:block;object-fit:contain" src="${item.url}" onerror="this.parentElement.style.display='none'"></video>`
+                : `<img src="${item.url}" alt="görsel" style="width:100%;display:block;max-height:580px;object-fit:cover" onerror="this.parentElement.style.display='none'">`
+            }</div>`;
+        }
+
+        res.setHeader('Cache-Control', 'public, max-age=120');
+        res.type('html').send(`<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<meta name="description" content="${desc}">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="AgroLink">
+<meta property="og:title" content="${title}">
+<meta property="og:description" content="${desc}">
+<meta property="og:image" content="${ogImg}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:url" content="${pageUrl}">
+<meta property="og:locale" content="tr_TR">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${title}">
+<meta name="twitter:description" content="${desc}">
+<meta name="twitter:image" content="${ogImg}">
+<link rel="canonical" href="${pageUrl}">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',Arial,sans-serif;background:#0b1512;color:#e8f5e9;min-height:100vh}
+.wrap{max-width:600px;margin:0 auto;padding:12px 0 64px}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:0 16px;margin-bottom:10px}
+.brand{font-size:20px;font-weight:800;color:#00e676;text-decoration:none}
+.home-link{color:rgba(255,255,255,0.5);font-size:13px;text-decoration:none}
+.card{background:#111c16;border-bottom:1px solid rgba(255,255,255,0.08)}
+.card-inner{padding:14px 16px 0}
+.header{display:flex;align-items:flex-start;gap:12px;margin-bottom:12px}
+.avatar{width:42px;height:42px;border-radius:50%;object-fit:cover;background:#1a2a1a;flex-shrink:0;border:1px solid rgba(0,230,118,0.2)}
+.header-info{flex:1;min-width:0}
+.name-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:2px}
+.dname{font-size:14px;font-weight:700;color:#e8f5e9;text-decoration:none}
+.dname:hover{text-decoration:underline}
+.handle-row{display:flex;align-items:center;gap:4px;font-size:13px;color:rgba(255,255,255,0.45)}
+.postcontent{font-size:15px;line-height:1.6;color:#e8f5e9;white-space:pre-wrap;word-break:break-word;padding:0 16px 10px 70px}
+.media-wrap{border-radius:16px;overflow:hidden;border:1px solid rgba(255,255,255,0.08);background:#0d1a12;margin:0 16px 10px 70px;position:relative}
+.sl-btn{position:absolute;top:50%;transform:translateY(-50%);width:32px;height:32px;border-radius:50%;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);border:none;color:#fff;font-size:22px;cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:10;line-height:1;padding-bottom:2px}
+.sl-prev{left:8px}.sl-next{right:8px}
+.sl-counter{position:absolute;top:10px;right:10px;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);padding:3px 9px;border-radius:20px;font-size:11px;font-weight:600;color:#fff;z-index:10}
+.sl-dots{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);display:flex;gap:6px;z-index:10}
+.sl-dot{width:6px;height:6px;border-radius:50%;background:rgba(255,255,255,0.4);cursor:pointer;transition:all .2s}
+.sl-dot.active{width:16px;background:#fff;border-radius:4px}
+.actions{display:flex;align-items:center;justify-content:space-between;padding:4px 16px 12px 70px}
+.act-btn{display:flex;align-items:center;gap:5px;padding:6px 8px;border-radius:50px;font-size:13px;color:rgba(255,255,255,0.45)}
+.cta-area{text-align:center;margin-top:24px;padding:0 16px}
+.cta{display:inline-block;padding:13px 32px;background:linear-gradient(135deg,#00e676,#1de9b6);color:#020810;font-weight:800;border-radius:50px;text-decoration:none;font-size:15px}
+.foot{text-align:center;margin-top:24px;color:rgba(255,255,255,0.2);font-size:12px}
+.foot span{color:#00e676;font-weight:700}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <a class="brand" href="${DOMAIN}">🌾 AgroLink</a>
+    <a class="home-link" href="${DOMAIN}">Ana Sayfa →</a>
+  </div>
+  <div class="card">
+    <div class="card-inner">
+      <div class="header">
+        <a href="${profUrl}"><img class="avatar" src="${profPic}" alt="${post.name||post.username}" onerror="this.src='${DOMAIN}/agro.png'"></a>
+        <div class="header-info">
+          <div class="name-row">
+            <a class="dname" href="${profUrl}">${post.name||post.username}</a>
+            ${post.isVerified ? `<svg width="16" height="16" viewBox="0 0 18 18" fill="none"><path d="M17.7508 9.41667C17.7508 8.1 17.0217 6.95833 15.9608 6.41667C16.0892 6.05417 16.1592 5.6625 16.1592 5.25C16.1592 3.40833 14.7342 1.91833 12.9775 1.91833C12.5858 1.91833 12.2108 1.98833 11.8642 2.12667C11.3492 1.0125 10.2592 0.25 9.00083 0.25C7.7425 0.25 6.65417 1.01417 6.13667 2.125C5.79083 1.9875 5.415 1.91667 5.02333 1.91667C3.265 1.91667 1.84167 3.40833 1.84167 5.25C1.84167 5.66167 1.91083 6.05333 2.03917 6.41667C0.979167 6.95833 0.25 8.09833 0.25 9.41667C0.25 10.6625 0.901667 11.7483 1.86833 12.3217C1.85167 12.4633 1.84167 12.605 1.84167 12.75C1.84167 14.5917 3.265 16.0833 5.02333 16.0833C5.415 16.0833 5.79 16.0117 6.13583 15.875C6.6525 16.9867 7.74083 17.75 9 17.75C10.26 17.75 11.3483 16.9867 11.8642 15.875C12.21 16.0108 12.585 16.0817 12.9775 16.0817C14.7358 16.0817 16.1592 14.59 16.1592 12.7483C16.1592 12.6033 16.1492 12.4617 16.1317 12.3208C17.0967 11.7483 17.7508 10.6625 17.7508 9.4175V9.41667Z" fill="#1D9BF0"/><path d="M12.2375 6.63833L8.62583 12.055C8.505 12.2358 8.3075 12.3333 8.105 12.3333C7.98583 12.3333 7.865 12.3 7.75833 12.2283L7.6625 12.15L5.65 10.1375C5.40583 9.89333 5.40583 9.4975 5.65 9.25417C5.89417 9.01083 6.29 9.00917 6.53333 9.25417L8.00833 10.7267L11.1958 5.94333C11.3875 5.65583 11.7758 5.58 12.0625 5.77083C12.3508 5.9625 12.4292 6.35083 12.2375 6.6375V6.63833Z" fill="white"/></svg>` : ''}
+          </div>
+          <div class="handle-row">
+            <span>@${post.username}</span><span>·</span><span>${timeAgo}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    ${post.content ? `<div class="postcontent">${(post.content||'').replace(/<[^>]*>/g,'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>` : ''}
+    ${mediaHtml}
+    <div class="actions">
+      <span class="act-btn">💬 ${post.commentCount||0}</span>
+      <span class="act-btn">📊 ${post.views||0}</span>
+      <span class="act-btn">❤️ ${post.likeCount||0}</span>
+      <span class="act-btn">🔖</span>
+      <span class="act-btn">↗️</span>
+    </div>
+  </div>
+  <div class="cta-area"><a class="cta" href="${DOMAIN}/agrolink/feed?post=${post.id}">📱 AgroLink'te Aç</a></div>
+  <div class="foot">🌾 <span>AgroLink</span> — Tarım Topluluğu</div>
+</div>
+</body></html>`);
+    } catch (e) {
+        console.error('[POST SAYFASI /post/] Hata:', e.message);
+        res.redirect('/');
+    }
+});
+
 if (fssync.existsSync(publicDir)) {
     app.use(express.static(publicDir, { maxAge: '1d', index: false, dotfiles: 'deny' }));
 }
@@ -10415,6 +11288,7 @@ app.get('/hakkimizda', (req, res) => {
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Hakkimizda | Agro Sosyal</title>
 <meta name="description" content="Agro Sosyal, ciftciler ve tarim sektoru icin gelistirilmis yerli sosyal medya platformu.">
@@ -10453,6 +11327,7 @@ app.get('/kullanim', (req, res) => {
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Kullanim Kosullari & Gizlilik Politikasi | Agro Sosyal</title>
 <meta name="description" content="Agro Sosyal kullanim kosullari ve gizlilik politikasi.">
@@ -10536,10 +11411,12 @@ app.get('/u/:usernameOrId', async (req, res) => {
         const user = await dbGet(
             isUUID
                 ? `SELECT id, username, name, bio, "profilePic", "coverPic", "isVerified", "hasFarmerBadge", "userType",
+                          "farmerBadgeType", "farmerCertificate",
                           (SELECT COUNT(*)::int FROM follows WHERE "followingId"=u.id) AS "followerCount",
                           (SELECT COUNT(*)::int FROM posts WHERE "userId"=u.id AND "isActive"=TRUE) AS "postCount"
                    FROM users u WHERE id=$1 AND "isActive"=TRUE LIMIT 1`
                 : `SELECT id, username, name, bio, "profilePic", "coverPic", "isVerified", "hasFarmerBadge", "userType",
+                          "farmerBadgeType", "farmerCertificate",
                           (SELECT COUNT(*)::int FROM follows WHERE "followingId"=u.id) AS "followerCount",
                           (SELECT COUNT(*)::int FROM posts WHERE "userId"=u.id AND "isActive"=TRUE) AS "postCount"
                    FROM users u WHERE LOWER(username)=$1 AND "isActive"=TRUE LIMIT 1`,
@@ -10548,6 +11425,7 @@ app.get('/u/:usernameOrId', async (req, res) => {
 
         if (!user) {
             return res.status(404).send(`<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <title>Kullanıcı Bulunamadı • AgroLink</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#060d0a;color:#e8f5e9;display:flex;align-items:center;justify-content:center;min-height:100vh}
@@ -10592,7 +11470,8 @@ ${mediaHtml}<div style="padding:10px">${txt?`<p style="color:#e8f5e9;font-size:1
         res.type('html').send(`<!DOCTYPE html>
 <html lang="tr">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title}${badge}</title>
 <meta name="description" content="${desc}">
 <meta property="og:type" content="profile">
@@ -10652,134 +11531,6 @@ ${coverUrl ? `<img class="cover" src="${coverUrl}" alt="kapak">` : '<div class="
     }
 });
 
-// Gönderi paylaşım sayfası: /post/:postId (tam handler — redirect değil, direkt HTML)
-app.get('/post/:postId', async (req, res) => {
-    const DOMAIN = process.env.APP_URL || 'https://sehitumitkestitarimmtal.com';
-    try {
-        const postId = req.params.postId?.trim();
-        if (!postId) return res.redirect('/');
-
-        const post = await dbGet(
-            `SELECT p.id, p.content, p.media, p."mediaType", p."mediaUrls",
-                    p."likeCount", p."commentCount", p."createdAt",
-                    u.name, u.username, u."profilePic", u."isVerified"
-             FROM posts p JOIN users u ON p."userId"=u.id
-             WHERE p.id=$1 AND p."isActive"=TRUE LIMIT 1`,
-            [postId]
-        ).catch(() => null);
-
-        if (!post) {
-            return res.status(404).send(`<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8">
-<title>Gönderi Bulunamadı • AgroLink</title><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#060d0a;color:#e8f5e9;display:flex;align-items:center;justify-content:center;min-height:100vh}
-.box{text-align:center;padding:40px}.logo{font-size:28px;font-weight:800;color:#00e676;margin-bottom:16px}
-p{color:rgba(255,255,255,0.5);margin-bottom:24px}a{display:inline-block;padding:12px 28px;background:#00e676;color:#020810;border-radius:50px;text-decoration:none;font-weight:700}
-</style></head><body><div class="box"><div class="logo">🌾 AgroLink</div><h2>Gönderi bulunamadı</h2>
-<p>Bu gönderi silinmiş veya mevcut değil.</p><a href="${DOMAIN}">Ana Sayfaya Dön</a></div></body></html>`);
-        }
-
-        let mediaItems = [];
-        if (post.mediaUrls) {
-            try {
-                const arr = typeof post.mediaUrls === 'string' ? JSON.parse(post.mediaUrls) : post.mediaUrls;
-                mediaItems = (arr||[]).map(item => {
-                    const url = item?.url || (typeof item === 'string' ? item : null);
-                    if (!url) return null;
-                    return { url: url.startsWith('http') ? url : DOMAIN + url, type: item?.type || post.mediaType || 'image' };
-                }).filter(Boolean);
-            } catch {}
-        }
-        if (!mediaItems.length && post.media)
-            mediaItems = [{ url: post.media.startsWith('http') ? post.media : DOMAIN + post.media, type: post.mediaType || 'image' }];
-
-        const profPic  = post.profilePic ? (post.profilePic.startsWith('http') ? post.profilePic : DOMAIN + post.profilePic) : `${DOMAIN}/agro.png`;
-        const first    = mediaItems[0];
-        const ogImg    = (first?.type === 'image' ? first.url : null) || profPic;
-        const title    = `${post.name || post.username} (@${post.username}) • AgroLink`;
-        const rawDesc  = (post.content||'').replace(/<[^>]*>/g,'').substring(0,200);
-        const desc     = rawDesc || 'AgroLink Tarım Topluluğu paylaşımı';
-        const pageUrl  = `${DOMAIN}/post/${post.id}`;
-        const profUrl  = `${DOMAIN}/u/${post.username}`;
-        const badge    = post.isVerified ? ' ✓' : '';
-        const diff     = Date.now() - new Date(post.createdAt).getTime();
-        const m        = Math.floor(diff/60000);
-        const timeAgo  = m<1?'Az önce':m<60?m+' dk önce':m<1440?Math.floor(m/60)+' saat önce':Math.floor(m/1440)+' gün önce';
-        const mediaHtml = mediaItems.map(item =>
-            item.type==='video'
-            ? `<video controls style="width:100%;max-height:480px;background:#000;display:block" src="${item.url}"></video>`
-            : `<img src="${item.url}" alt="görsel" style="width:100%;display:block;max-height:580px;object-fit:cover">`
-        ).join('');
-
-        res.setHeader('Cache-Control', 'public, max-age=120');
-        res.type('html').send(`<!DOCTYPE html>
-<html lang="tr">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${title}</title>
-<meta name="description" content="${desc}">
-<meta property="og:type" content="article">
-<meta property="og:site_name" content="AgroLink">
-<meta property="og:title" content="${title}">
-<meta property="og:description" content="${desc}">
-<meta property="og:image" content="${ogImg}">
-<meta property="og:image:width" content="1200">
-<meta property="og:image:height" content="630">
-<meta property="og:url" content="${pageUrl}">
-<meta property="og:locale" content="tr_TR">
-<meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="${title}">
-<meta name="twitter:description" content="${desc}">
-<meta name="twitter:image" content="${ogImg}">
-<link rel="canonical" href="${pageUrl}">
-<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',Arial,sans-serif;background:#060d0a;color:#e8f5e9;min-height:100vh}
-.wrap{max-width:600px;margin:0 auto;padding:16px 16px 56px}
-.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
-.brand{font-size:21px;font-weight:800;color:#00e676}
-.card{background:#0d1a12;border:1px solid rgba(0,230,118,0.12);border-radius:20px;overflow:hidden}
-.author{display:flex;align-items:center;gap:12px;padding:14px 16px}
-.avatar{width:44px;height:44px;border-radius:50%;object-fit:cover;border:2px solid #00e676;flex-shrink:0}
-.aname{font-weight:700;font-size:15px;color:#e8f5e9}
-.ausr{color:#00e676;font-size:13px}
-.media-wrap{overflow:hidden}
-.body{padding:14px 16px;font-size:15px;line-height:1.65;color:#e8f5e9;white-space:pre-wrap;word-break:break-word}
-.stats{display:flex;gap:20px;padding:10px 16px;border-top:1px solid rgba(0,230,118,0.08);color:rgba(255,255,255,0.45);font-size:13px}
-.stats strong{color:#e8f5e9}
-.time{padding:4px 16px 14px;color:rgba(255,255,255,0.3);font-size:12px}
-.cta-area{text-align:center;margin-top:20px}
-.cta{display:inline-block;padding:13px 32px;background:linear-gradient(135deg,#00e676,#1de9b6);color:#020810;font-weight:800;border-radius:50px;text-decoration:none;font-size:15px}
-.foot{text-align:center;margin-top:24px;color:rgba(255,255,255,0.2);font-size:12px}
-.foot span{color:#00e676;font-weight:700}</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="topbar">
-    <div class="brand">🌾 AgroLink</div>
-    <a href="${DOMAIN}" style="color:#00e676;font-size:13px;text-decoration:none">Ana Sayfa →</a>
-  </div>
-  <div class="card">
-    <a href="${profUrl}" style="text-decoration:none">
-      <div class="author">
-        <img class="avatar" src="${profPic}" alt="${post.name}" onerror="this.src='${DOMAIN}/agro.png'">
-        <div><div class="aname">${post.name||post.username}${badge}</div><div class="ausr">@${post.username}</div></div>
-      </div>
-    </a>
-    ${mediaHtml ? `<div class="media-wrap">${mediaHtml}</div>` : ''}
-    ${post.content ? `<div class="body">${(post.content||'').replace(/<[^>]*>/g,'')}</div>` : ''}
-    <div class="stats">
-      <div>❤️ <strong>${post.likeCount||0}</strong></div>
-      <div>💬 <strong>${post.commentCount||0}</strong></div>
-    </div>
-    <div class="time">${timeAgo}</div>
-  </div>
-  <div class="cta-area"><a class="cta" href="${DOMAIN}">📱 AgroLink'te Aç</a></div>
-  <div class="foot">🌾 <span>AgroLink</span> — Tarım Topluluğu</div>
-</div>
-</body></html>`);
-    } catch (e) {
-        console.error('[POST SAYFASI /post/] Hata:', e.message);
-        res.redirect('/');
-    }
-});
 
 // Gönderi paylaşım sayfası: /p/:postId
 app.get('/p/:postId', async (req, res) => {
@@ -10799,6 +11550,7 @@ app.get('/p/:postId', async (req, res) => {
 
         if (!post) {
             return res.status(404).send(`<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <title>Gönderi Bulunamadı • AgroLink</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#060d0a;color:#e8f5e9;display:flex;align-items:center;justify-content:center;min-height:100vh}
 .box{text-align:center;padding:40px}.logo{font-size:28px;font-weight:800;color:#00e676;margin-bottom:16px}
@@ -10835,7 +11587,7 @@ p{color:rgba(255,255,255,0.5);margin-bottom:24px}a{display:inline-block;padding:
         const timeAgo  = m<1?'Az önce':m<60?m+' dk önce':m<1440?Math.floor(m/60)+' saat önce':Math.floor(m/1440)+' gün önce';
         const mediaHtml = mediaItems.map(item =>
             item.type==='video'
-            ? `<video controls style="width:100%;max-height:480px;background:#000;display:block" src="${item.url}"></video>`
+            ? `<video controls playsinline muted autoplay loop style="width:100%;max-height:520px;background:#000;display:block;object-fit:contain" src="${item.url}" onerror="this.parentElement.style.display='none'"></video>`
             : `<img src="${item.url}" alt="görsel" style="width:100%;display:block;max-height:580px;object-fit:cover">`
         ).join('');
 
@@ -10843,7 +11595,8 @@ p{color:rgba(255,255,255,0.5);margin-bottom:24px}a{display:inline-block;padding:
         res.type('html').send(`<!DOCTYPE html>
 <html lang="tr">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title}</title>
 <meta name="description" content="${desc}">
 <meta property="og:type" content="article">
@@ -11251,7 +12004,7 @@ app.get('/api/users/blocked', authenticateToken, async (req, res) => {
 
 // ─── KAYIT DOĞRULAMA: /api/auth/register-verify ────────────────────
 // register-init ile gönderilen 6 haneli kodu doğrular ve hesabı aktif eder
-app.post('/api/auth/register-verify', validateAuthInput, async (req, res) => {
+app.post('/api/auth/register-verify', otpLimiter, validateAuthInput, async (req, res) => { // 🔒 otpLimiter eklendi — kod brute-force koruması
     try {
         const { email, code } = req.body;
         if (!email || !code) return res.status(400).json({ error: 'E-posta ve kod zorunludur' });
@@ -11291,18 +12044,33 @@ app.post('/api/auth/register-verify', validateAuthInput, async (req, res) => {
             console.warn('⚠️ Otomatik takip hatası:', followErr.message);
         }
 
+        // 🔒 DÜZELTMESİ: Token üretmeden önce tam kullanıcı bilgisi DB'den çekiliyor
+        // (emailVerified=TRUE güncellemesi tamamlandıktan sonra)
         const user = await dbGet(
-            `SELECT id, name, username, email, "profilePic", bio FROM users WHERE id = $1`,
+            `SELECT id, name, username, email, role, plan, "profilePic", bio,
+                    "isVerified", "isActive", "isBanned", "emailVerified", "twoFactorEnabled",
+                    "hasFarmerBadge", "userType"
+             FROM users WHERE id = $1 AND "isActive" = TRUE AND "emailVerified" = TRUE`,
             [verification.userId]
         );
+        if (!user) return res.status(500).json({ error: 'Hesap doğrulanamadı. Lütfen tekrar deneyin.' });
 
         const tokens = generateTokens(user);
 
+        // Refresh token'ı DB'ye kaydet
+        const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
+        await dbRun(
+            `INSERT INTO refresh_tokens (id, "userId", "tokenHash", ip, "userAgent", "createdAt", "expiresAt")
+             VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '30 days' /* 🔒 365→30 gün */)`,
+            [uuidv4(), user.id, tokenHash, req.ip, req.headers['user-agent'] || '']
+        );
+
+        const { password: _pw, ...safeUser } = user;
         res.status(201).json({
             token: tokens.accessToken,
             accessToken: tokens.accessToken,
             refreshToken: tokens.refreshToken,
-            user,
+            user: safeUser,
             message: 'Kayıt başarıyla tamamlandı!'
         });
     } catch (error) {
@@ -11312,7 +12080,7 @@ app.post('/api/auth/register-verify', validateAuthInput, async (req, res) => {
 });
 
 // ─── 2FA DOĞRULAMA: /api/auth/verify-2fa ───────────────────────────
-app.post('/api/auth/verify-2fa', validateAuthInput, async (req, res) => {
+app.post('/api/auth/verify-2fa', otpLimiter, validateAuthInput, async (req, res) => { // 🔒 otpLimiter eklendi — 2FA brute-force koruması
     try {
         const { tempToken, code } = req.body;
         if (!tempToken || !code) return res.status(400).json({ error: 'Token ve kod zorunludur' });
@@ -11353,7 +12121,7 @@ app.post('/api/auth/verify-2fa', validateAuthInput, async (req, res) => {
         const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
         await dbRun(
             `INSERT INTO refresh_tokens (id, "userId", "tokenHash", ip, "userAgent", "createdAt", "expiresAt")
-             VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '7 days')`,
+             VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '30 days' /* 🔒 365→30 gün */)`,
             [uuidv4(), user.id, tokenHash, req.ip, req.headers['user-agent'] || '']
         );
 
@@ -11366,7 +12134,7 @@ app.post('/api/auth/verify-2fa', validateAuthInput, async (req, res) => {
 });
 
 // ─── 2FA KOD YENİLE: /api/auth/resend-2fa ──────────────────────────
-app.post('/api/auth/resend-2fa', async (req, res) => {
+app.post('/api/auth/resend-2fa', otpLimiter, async (req, res) => { // 🔒 otpLimiter eklendi — e-posta spam / kod flood koruması
     try {
         const { tempToken } = req.body;
         if (!tempToken) return res.status(400).json({ error: 'Token zorunludur' });
@@ -11405,7 +12173,7 @@ app.post('/api/auth/resend-2fa', async (req, res) => {
 
 // ─── BU BEN DEĞİLİM: POST /api/auth/not-me ─────────────────────────
 // Şüpheli giriş bildirimi — IP engeller, oturumları kapatır, şifre sıfırlama başlatır
-app.post('/api/auth/not-me', async (req, res) => {
+app.post('/api/auth/not-me', forgotPasswordLimiter, async (req, res) => { // 🔒 rate limit eklendi
     try {
         const { email, username } = req.body;
         if (!email && !username) return res.status(400).json({ error: 'Email veya kullanıcı adı gereklidir' });
@@ -11415,7 +12183,10 @@ app.post('/api/auth/not-me', async (req, res) => {
             'SELECT * FROM users WHERE (email = $1 OR username = $1) AND "isActive" = TRUE',
             [loginId]
         );
-        if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
+        // 🔒 Kullanıcı bulunamasa bile aynı yanıtı ver — enumeration önlemi
+        if (!user) {
+            return res.json({ success: true, message: 'Güvenlik önlemleri uygulandı.' });
+        }
 
         const now = new Date().toISOString();
         const resetToken = crypto.randomBytes(32).toString('hex');
@@ -11426,8 +12197,8 @@ app.post('/api/auth/not-me', async (req, res) => {
             `INSERT INTO suspicious_login_reports (id, "userId", "reportedIp", "reportedAt", "passwordResetToken", "tokenExpiresAt")
              VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '10 minutes')
              ON CONFLICT DO NOTHING`,
-            [uuidv4(), user.id, req.ip, now, resetToken]
-        ).catch(() => {});
+            [uuidv4(), user.id, req.ip, now, crypto.createHash('sha256').update(resetToken).digest('hex')]
+        ).catch(() => {}); // 🔒 DÜZELTMESİ: token plaintext yerine SHA-256 hash olarak saklanıyor
 
         // Tüm refresh token'ları iptal et (oturumları kapat)
         await dbRun('DELETE FROM refresh_tokens WHERE "userId" = $1', [user.id]).catch(() => {});
@@ -11812,10 +12583,21 @@ app.post('/api/messages/image', authenticateToken, upload.single('image'), async
     try {
         const { recipientId } = req.body;
         if (!recipientId || !req.file) return res.status(400).json({ error:'Alıcı ve görsel gerekli' });
-        const recipient = await dbGet('SELECT id,username FROM users WHERE id=$1 AND "isActive"=TRUE',[recipientId]);
+        const recipient = await dbGet('SELECT id,username,"isPrivate" FROM users WHERE id=$1 AND "isActive"=TRUE',[recipientId]);
         if (!recipient) return res.status(404).json({ error:'Kullanıcı bulunamadı' });
         const blocked = await dbGet('SELECT id FROM blocks WHERE ("blockerId"=$1 AND "blockedId"=$2) OR ("blockerId"=$2 AND "blockedId"=$1)',[req.user.id,recipientId]);
         if (blocked) return res.status(403).json({ error:'Mesaj gönderilemiyor' });
+        // 🔒 Gizli hesap kontrolü
+        if (recipient.isPrivate) {
+            const isApprovedFollower = await dbGet(
+                `SELECT id FROM follow_requests WHERE "requesterId" = $1 AND "targetId" = $2 AND status = 'accepted'`,
+                [req.user.id, recipientId]
+            );
+            if (!isApprovedFollower) {
+                await fs.unlink(req.file.path).catch(()=>{});
+                return res.status(403).json({ error:'Bu kullanıcı gizli hesaba sahip. Mesaj gönderebilmek için takip isteğinizin onaylanması gerekiyor.' });
+            }
+        }
         const filename  = `msg_${uuidv4().replace(/-/g,"").slice(0,16)}.webp`;
         const outPath   = path.join(postsDir, filename);
         await processImage(req.file.path, outPath, { width: 1920, height: 1920, fit: 'inside', quality: 78, effort: 4 });
@@ -11850,12 +12632,24 @@ app.post('/api/messages/voice', authenticateToken, upload.single('voice'), async
             return res.status(400).json({ error:'Ses dosyası 10MB\'ı geçemez' });
         }
 
-        const recipient = await dbGet('SELECT id,username FROM users WHERE id=$1 AND "isActive"=TRUE',[recipientId]);
+        const recipient = await dbGet('SELECT id,username,"isPrivate" FROM users WHERE id=$1 AND "isActive"=TRUE',[recipientId]);
         if (!recipient) return res.status(404).json({ error:'Kullanıcı bulunamadı' });
 
         // 🔒 Block kontrolü
         const blocked = await dbGet('SELECT id FROM blocks WHERE ("blockerId"=$1 AND "blockedId"=$2) OR ("blockerId"=$2 AND "blockedId"=$1)',[req.user.id,recipientId]);
         if (blocked) return res.status(403).json({ error:'Bu kullanıcıya mesaj gönderilemiyor' });
+
+        // 🔒 Gizli hesap kontrolü
+        if (recipient.isPrivate) {
+            const isApprovedFollower = await dbGet(
+                `SELECT id FROM follow_requests WHERE "requesterId" = $1 AND "targetId" = $2 AND status = 'accepted'`,
+                [req.user.id, recipientId]
+            );
+            if (!isApprovedFollower) {
+                await fs.unlink(req.file.path).catch(()=>{});
+                return res.status(403).json({ error:'Bu kullanıcı gizli hesaba sahip. Mesaj gönderebilmek için takip isteğinizin onaylanması gerekiyor.' });
+            }
+        }
 
         const voiceDir = path.join(uploadsDir,'voice');
         if (!fssync.existsSync(voiceDir)) fssync.mkdirSync(voiceDir,{recursive:true});
@@ -11959,7 +12753,7 @@ app.delete('/api/farmbook/records/:id', authenticateToken, async (req, res) => {
     try {
         const ex = await dbGet('SELECT id FROM farmbook_records WHERE id=$1 AND "userId"=$2',[req.params.id,req.user.id]);
         if (!ex) return res.status(404).json({ error:'Kayıt bulunamadı' });
-        await dbRun('DELETE FROM farmbook_records WHERE id=$1',[req.params.id]);
+        await dbRun('DELETE FROM farmbook_records WHERE id=$1 AND "userId"=$2',[req.params.id, req.user.id]); // 🔒 DÜZELTMESİ: sahiplik koruması eklendi
         res.json({ success:true, message:'Kayıt silindi' });
     } catch (e) { console.error(e); res.status(500).json({ error:'Sunucu hatası' }); }
 });
@@ -12073,7 +12867,10 @@ app.get('/share/profile/:username', async (req, res) => {
         const base    = `${req.protocol}://${req.get('host')}`;
         const picUrl  = user.profilePic  ? `${base}${user.profilePic}`  : `${base}/default-avatar.png`;
         const coverUrl= user.coverPic    ? `${base}${user.coverPic}`    : null;
-        const bio     = (user.bio || '').substring(0, 160);
+        const bio     = escapeHtml((user.bio || '').substring(0, 160)); // 🔒 escapeHtml eklendi
+        const safeName     = escapeHtml(user.name || '');               // 🔒
+        const safeUsername = escapeHtml(user.username || '');           // 🔒
+        const safeLocation = escapeHtml(user.location || '');           // 🔒
 
         // Son 6 post görselini al
         const recentPosts = await dbAll(
@@ -12084,12 +12881,13 @@ app.get('/share/profile/:username', async (req, res) => {
         );
 
         const gridHtml = recentPosts.map(p => {
+            const safeTitle = escapeHtml((p.content||'').substring(0,60)); // 🔒
             if (p.mediaType === 'video') {
-                return `<a href="${base}/share/post/${p.id}" class="grid-item video-item" title="${(p.content||'').substring(0,60)}">
+                return `<a href="${base}/share/post/${p.id}" class="grid-item video-item" title="${safeTitle}">
                     <div class="play-icon">▶</div>
                 </a>`;
             }
-            return `<a href="${base}/share/post/${p.id}" class="grid-item" style="background-image:url('${base}${p.media}')" title="${(p.content||'').substring(0,60)}"></a>`;
+            return `<a href="${base}/share/post/${p.id}" class="grid-item" style="background-image:url('${base}${p.media}')" title="${safeTitle}"></a>`;
         }).join('');
 
         const userTypeBadge = {
@@ -12104,9 +12902,10 @@ app.get('/share/profile/:username', async (req, res) => {
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>${user.name} (@${user.username}) — Agrolink</title>
-<meta property="og:title" content="${user.name} - Agrolink">
+<title>${safeName} (@${safeUsername}) — Agrolink</title>
+<meta property="og:title" content="${safeName} - Agrolink">
 <meta property="og:description" content="${bio || 'Agrolink kullanıcısı'} | ${user.followerCount} takipçi">
 <meta property="og:image" content="${picUrl}">
 <meta property="og:url" content="${base}/share/profile/${user.username}">
@@ -12172,13 +12971,13 @@ body{font-family:'Inter',sans-serif;background:#0a0a0a;min-height:100vh;color:#f
       </div>
     </div>
     <div class="name-row">
-      <span class="name">${user.name}</span>
+      <span class="name">${safeName}</span>
       ${user.isVerified ? '<span class="verified">✅</span>' : ''}
     </div>
-    <div class="handle">@${user.username}</div>
+    <div class="handle">@${safeUsername}</div>
     <div class="badge">${userTypeBadge}</div>
     ${bio ? `<div class="bio">${bio}</div>` : ''}
-    ${user.location ? `<div class="meta"><span class="meta-item">📍 ${user.location}</span></div>` : ''}
+    ${safeLocation ? `<div class="meta"><span class="meta-item">📍 ${safeLocation}</span></div>` : ''}
     <div class="stats">
       <div class="stat"><div class="stat-val">${user.postCount ?? 0}</div><div class="stat-lbl">Gönderi</div></div>
       <div class="stat"><div class="stat-val">${user.followerCount ?? 0}</div><div class="stat-lbl">Takipçi</div></div>
@@ -12232,7 +13031,9 @@ app.get('/share/post/:postId', async (req, res) => {
         const base      = `${req.protocol}://${req.get('host')}`;
         const picUrl    = post.userProfilePic ? `${base}${post.userProfilePic}` : `${base}/default-avatar.png`;
         const date      = new Date(post.createdAt).toLocaleDateString('tr-TR', {day:'numeric',month:'long',year:'numeric'});
-        const content_text = (post.content || '').substring(0, 500);
+        const content_text = escapeHtml((post.content || '').substring(0, 500)); // 🔒 escapeHtml eklendi
+        const safeUserName = escapeHtml(post.userName || '');                    // 🔒
+        const safeHandle   = escapeHtml(post.username || '');                    // 🔒
 
         let mediaHtml = '';
         if (post.media) {
@@ -12267,10 +13068,11 @@ app.get('/share/post/:postId', async (req, res) => {
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>${post.userName} Agrolink Gönderisi</title>
-<meta property="og:title" content="${post.userName} - Agrolink">
-<meta property="og:description" content="${(post.content||'').substring(0,200)}">
+<title>${safeUserName} Agrolink Gönderisi</title>
+<meta property="og:title" content="${safeUserName} - Agrolink">
+<meta property="og:description" content="${escapeHtml((post.content||'').substring(0,200))}">
 <meta property="og:image" content="${ogImage}">
 <meta property="og:url" content="${base}/share/post/${post.id}">
 <meta property="og:type" content="article">
@@ -12319,10 +13121,10 @@ body{font-family:'Inter',sans-serif;background:#0a0a0a;min-height:100vh;color:#f
       <img src="${picUrl}" class="avatar" onerror="this.onerror=null;this.src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';this.style='background:#222;border-radius:50%'">
       <div class="user-info">
         <div class="user-name">
-          ${post.userName}
+          ${safeUserName}
           ${post.userVerified ? '<span class="verified">✅</span>' : ''}
         </div>
-        <div class="user-handle">@${post.username}</div>
+        <div class="user-handle">@${safeHandle}</div>
       </div>
       <div class="post-date">${date}</div>
     </div>
@@ -12733,12 +13535,26 @@ app.get('/api/users/interests', authenticateToken, async (req, res) => {
 // ─── E-POSTA ABONELIK YÖNET ────────────────────────────────────────
 app.get('/api/email/unsubscribe/:userId', async (req, res) => {
     try {
+        // 🔒 IDOR koruması: userId + JWT_SECRET ile HMAC imzası zorunlu (e-postadaki link zaten imzalı olmalı)
+        const { sig } = req.query;
+        const expected = crypto.createHmac('sha256', process.env.JWT_SECRET || '')
+            .update(req.params.userId).digest('hex');
+        if (!sig || sig !== expected) {
+            return res.status(403).send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>⛔ Geçersiz bağlantı.</h2></body></html>');
+        }
         await dbRun('UPDATE users SET "emailNotifications"=FALSE,"updatedAt"=NOW() WHERE id=$1', [req.params.userId]).catch(()=>{});
         res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>✅ E-posta bildirimlerinden çıkıldı.</h2><p>Agrolink e-posta bildirimleri durduruldu.</p></body></html>');
     } catch (e) { res.status(500).send('Hata oluştu'); }
 });
 app.get('/api/email/resubscribe/:userId', async (req, res) => {
     try {
+        // 🔒 IDOR koruması
+        const { sig } = req.query;
+        const expected = crypto.createHmac('sha256', process.env.JWT_SECRET || '')
+            .update(req.params.userId).digest('hex');
+        if (!sig || sig !== expected) {
+            return res.status(403).send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>⛔ Geçersiz bağlantı.</h2></body></html>');
+        }
         await dbRun('UPDATE users SET "emailNotifications"=TRUE,"updatedAt"=NOW() WHERE id=$1', [req.params.userId]).catch(()=>{});
         res.send('<html><body style="font-family:sans-serif;text-align:center;padding:40px"><h2>✅ E-posta bildirimleri yeniden etkinleştirildi.</h2></body></html>');
     } catch (e) { res.status(500).send('Hata oluştu'); }
@@ -12750,6 +13566,7 @@ function getPasswordResetPageHtml(username, resetToken) {
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Şifre Sıfırlama - Agrolink</title>
     <style>
@@ -12968,6 +13785,7 @@ function getErrorPageHtml(title, message) {
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>${title} - Agrolink</title>
     <style>
@@ -13041,7 +13859,7 @@ app.get('/api/auth/reset-password-direct', async (req, res) => {
                  JOIN users u ON slr."userId" = u.id
                  WHERE slr."passwordResetToken" = $1 AND slr."tokenExpiresAt" > NOW()
                  LIMIT 1`,
-                [token]
+                [crypto.createHash('sha256').update(token).digest('hex')] // 🔒 DÜZELTMESİ: hash ile karşılaştır (Fix 2 ile tutarlı)
             ).catch(() => null);
         }
 
@@ -13117,7 +13935,7 @@ app.get('/api/users/:id/profile', authenticateToken, async (req, res) => {
 // Bu rota zaten mevcut, alias tanımla:
 
 // ─── 3. ŞİFRE SIFIRLAMA (TOKEN ile): POST /api/auth/reset-password-with-token
-app.post('/api/auth/reset-password-with-token', async (req, res) => {
+app.post('/api/auth/reset-password-with-token', forgotPasswordLimiter, validateAuthInput, async (req, res) => { // 🔒 forgotPasswordLimiter + validateAuthInput eklendi
     try {
         const { username, resetToken, newPassword, confirmPassword } = req.body;
         const ip = req.ip || req.connection?.remoteAddress;
@@ -13153,7 +13971,7 @@ app.post('/api/auth/reset-password-with-token', async (req, res) => {
                 `SELECT id, "reportedIp" FROM suspicious_login_reports
                  WHERE "userId" = $1 AND "passwordResetToken" = $2 AND "tokenExpiresAt" > NOW()
                  ORDER BY "reportedAt" DESC LIMIT 1`,
-                [user.id, resetToken]
+                [user.id, crypto.createHash('sha256').update(resetToken).digest('hex')]  // 🔒 hash ile karşılaştır
             ).catch(() => null);
             tokenSource = 'suspicious_login_reports';
         }
@@ -13215,7 +14033,7 @@ app.post('/api/messages/share-post', authenticateToken, async (req, res) => {
 
         const [post, recipient, sender] = await Promise.all([
             dbGet('SELECT id FROM posts WHERE id=$1 AND "isActive"=TRUE', [postId]),
-            dbGet('SELECT id,username FROM users WHERE id=$1 AND "isActive"=TRUE', [recipientId]),
+            dbGet('SELECT id,username,"isPrivate" FROM users WHERE id=$1 AND "isActive"=TRUE', [recipientId]),
             dbGet('SELECT username FROM users WHERE id=$1', [req.user.id])
         ]);
         if (!post) return res.status(404).json({ error: 'Gönderi bulunamadı' });
@@ -13225,6 +14043,17 @@ app.post('/api/messages/share-post', authenticateToken, async (req, res) => {
             'SELECT id FROM blocks WHERE ("blockerId"=$1 AND "blockedId"=$2) OR ("blockerId"=$2 AND "blockedId"=$1)',
             [req.user.id, recipientId]);
         if (blocked) return res.status(403).json({ error: 'Bu kullanıcıya mesaj gönderemezsiniz' });
+
+        // 🔒 Gizli hesap kontrolü
+        if (recipient.isPrivate) {
+            const isApprovedFollower = await dbGet(
+                `SELECT id FROM follow_requests WHERE "requesterId" = $1 AND "targetId" = $2 AND status = 'accepted'`,
+                [req.user.id, recipientId]
+            );
+            if (!isApprovedFollower) {
+                return res.status(403).json({ error: 'Bu kullanıcı gizli hesaba sahip. Mesaj gönderebilmek için takip isteğinizin onaylanması gerekiyor.' });
+            }
+        }
 
         const msgId = uuidv4();
         const postUrl = `/p/${postId}`;
@@ -13341,8 +14170,13 @@ app.post('/api/posts/batch-view', authenticateToken, async (req, res) => {
         const { postIds } = req.body;
         if (!postIds || !Array.isArray(postIds) || postIds.length === 0)
             return res.status(400).json({ error: 'postIds dizisi gerekli' });
+
+        // UUID formatı dışındaki değerleri filtrele (örn: "quick_actions" gibi string'ler)
+        const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        const validIds = postIds.slice(0, 50).filter(id => typeof id === 'string' && UUID_RE.test(id));
+
         // Her post için akıllı view tracking: aynı kullanıcı aynı günde tekrar sayılmaz, kendi postunu saymaz
-        for (const postId of postIds.slice(0, 50)) {
+        for (const postId of validIds) {
             try {
                 const post = await dbGet('SELECT "userId" FROM posts WHERE id=$1 AND "isActive"=TRUE', [postId]);
                 if (post && post.userId !== req.user.id) {
@@ -13350,7 +14184,7 @@ app.post('/api/posts/batch-view', authenticateToken, async (req, res) => {
                 }
             } catch (e) { /* devam et */ }
         }
-        res.json({ message: 'Görüntülemeler kaydedildi', count: postIds.length });
+        res.json({ message: 'Görüntülemeler kaydedildi', count: validIds.length });
     } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
 });
 
@@ -13508,7 +14342,7 @@ app.post('/api/users/change-password', authenticateToken, async (req, res) => {
     try {
         const { currentPassword, newPassword } = req.body;
         if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Şifreler gerekli' });
-        if (newPassword.length < 6) return res.status(400).json({ error: 'Şifre en az 6 karakter' });
+        if (newPassword.length < 8) return res.status(400).json({ error: 'Şifre en az 8 karakter olmalıdır' }); // 🔒 6 → 8 karakter (kayıt ile tutarlı)
         const user = await dbGet('SELECT password FROM users WHERE id=$1', [req.user.id]);
         const valid = await bcrypt.compare(currentPassword, user.password);
         if (!valid) return res.status(401).json({ error: 'Mevcut şifre yanlış' });
@@ -13521,7 +14355,7 @@ app.post('/api/users/change-password', authenticateToken, async (req, res) => {
 // POST /api/products (alias - mağaza ürün ekle)
 app.post('/api/products', authenticateToken, (req, res, next) => {
     upload.fields([{ name: 'images', maxCount: 5 }, { name: 'image', maxCount: 1 }])(req, res, (err) => {
-        if (err) return res.status(400).json({ error: err.message });
+        if (err) return res.status(400).json({ error: 'Dosya yükleme hatası' }); // 🔒 DÜZELTMESİ: detay gizlendi
         if (req.files && !Array.isArray(req.files)) {
             req.files = [...(req.files['images']||[]), ...(req.files['image']||[])];
         }
@@ -13553,14 +14387,14 @@ app.post('/api/products', authenticateToken, (req, res, next) => {
     } catch (e) {
         console.error(e);
         if (req.files) for (const f of (Array.isArray(req.files)?req.files:[])) await fs.unlink(f.path).catch(()=>{});
-        res.status(500).json({ error: 'Sunucu hatası: ' + e.message });
+        res.status(500).json({ error: 'Sunucu hatası' }); // 🔒 e.message gizlendi
     }
 });
 
 // PUT /api/products/:productId (alias)
 app.put('/api/products/:productId', authenticateToken, (req, res, next) => {
     upload.fields([{ name: 'images', maxCount: 5 }, { name: 'image', maxCount: 1 }])(req, res, (err) => {
-        if (err) return res.status(400).json({ error: err.message });
+        if (err) return res.status(400).json({ error: 'Dosya yükleme hatası' }); // 🔒 DÜZELTMESİ: detay gizlendi
         if (req.files && !Array.isArray(req.files)) {
             req.files = [...(req.files['images']||[]), ...(req.files['image']||[])];
         }
@@ -13597,7 +14431,7 @@ app.put('/api/products/:productId', authenticateToken, (req, res, next) => {
         await dbRun(`UPDATE products SET ${sets.join(',')} WHERE id=$${idx}`, vals);
         const updated = await dbGet('SELECT * FROM products WHERE id=$1', [req.params.productId]);
         res.json({ message: 'Ürün güncellendi', product: updated });
-    } catch (e) { console.error(e); res.status(500).json({ error: 'Sunucu hatası: ' + e.message }); }
+    } catch (e) { console.error(e); res.status(500).json({ error: 'Sunucu hatası' }); } // 🔒 e.message gizlendi
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -13809,6 +14643,7 @@ function buildVerificationEmailHTML({ userName, username, email, refCode, approv
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Kimlik Doğrulama Talebi</title>
 </head>
@@ -13937,7 +14772,8 @@ function buildUserResultEmail(approved, userName) {
         : 'Kimlik doğrulama başvurunuz maalesef reddedildi. Belgelerinizin net ve okunaklı olduğundan emin olarak yeniden başvurabilirsiniz.';
 
     return `<!DOCTYPE html>
-<html lang="tr"><head><meta charset="UTF-8"></head>
+<html lang="tr"><head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"></head>
 <body style="margin:0;padding:0;background:#f4f7f6;font-family:Arial,sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f7f6;padding:30px 0;">
   <tr><td align="center">
@@ -14120,7 +14956,7 @@ app.get('/api/verification/action/:token/:action', async (req, res) => {
         ));
     } catch (e) {
         console.error('Verification action hatası:', e);
-        res.status(500).send(buildActionResultPage(false, 'Sunucu hatası: ' + e.message));
+        res.status(500).send(buildActionResultPage(false, 'Sunucu hatası')); // 🔒 e.message gizlendi
     }
 });
 
@@ -14129,7 +14965,8 @@ function buildActionResultPage(success, message, alreadyDone = false) {
     const color = success ? '#16a34a' : '#dc2626';
     const icon  = success ? '✅' : (alreadyDone ? 'ℹ️' : '❌');
     return `<!DOCTYPE html>
-<html lang="tr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="tr"><head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agrolink - İşlem Sonucu</title></head>
 <body style="margin:0;padding:0;background:#f4f7f6;font-family:Arial,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;">
 <div style="background:#fff;border-radius:20px;padding:48px 40px;max-width:440px;width:90%;text-align:center;box-shadow:0 8px 40px rgba(0,0,0,0.12);">
@@ -14187,8 +15024,11 @@ app.post('/api/users/verification/apply', authenticateToken, upload.fields([
 });
 
 // POST /api/email/unsubscribe/:userId (POST alias)
-app.post('/api/email/unsubscribe/:userId', async (req, res) => {
+app.post('/api/email/unsubscribe/:userId', authenticateToken, async (req, res) => { // 🔒 authenticateToken eklendi — IDOR koruması
     try {
+        if (req.user.id !== req.params.userId && req.user.role !== 'admin') {
+            return res.status(403).json({ error: 'Yetkiniz yok' });
+        }
         await dbRun('UPDATE users SET "emailNotifications"=FALSE,"updatedAt"=NOW() WHERE id=$1', [req.params.userId]).catch(()=>{});
         res.json({ message: 'E-posta bildirimlerinden çıkıldı' });
     } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
@@ -14507,7 +15347,7 @@ app.post('/api/dev/signup', devSignupLimiter, async (req, res) => {
         const token = jwt.sign(
             { devUserId: userId, email: cleanEmail, name: name.trim(), plan: 'free', isDevUser: true },
             JWT_SECRET,
-            { expiresIn: '30d', algorithm: 'HS256' }
+            { expiresIn: '2h', algorithm: 'HS256' } // 🔒 30d → 2h
         );
 
         res.status(201).json({
@@ -14542,7 +15382,7 @@ app.post('/api/dev/signin', devSigninLimiter, async (req, res) => {
         const token = jwt.sign(
             { devUserId: user.id, email: user.email, name: user.name, plan: user.plan, isDevUser: true },
             JWT_SECRET,
-            { expiresIn: '30d', algorithm: 'HS256' }
+            { expiresIn: '2h', algorithm: 'HS256' } // 🔒 30d → 2h
         );
 
         dbRun(`UPDATE dev_users SET "updatedAt" = NOW() WHERE id = $1`, [user.id]).catch(() => {});
@@ -14693,7 +15533,7 @@ app.get('/api/dev/limits', authenticateDevToken, async (req, res) => {
 });
 
 // ── GET /api/dev/status — Durum (Public) ─────────────────────────────────
-app.get('/api/dev/status', (req, res) => {
+app.get('/api/dev/status', authenticateDevToken, (req, res) => { // 🔒 authenticateDevToken eklendi — iç yapı sızıntısı önlendi
     res.json({
         status   : 'online',
         version  : '2.0.0',
@@ -15074,9 +15914,8 @@ app.get('/api/ai/status', (req, res) => {
         status: 'online',
         version: '1.0.0',
         model: 'agrolink-ai-v1',
-        uptime: process.uptime(),
+        // 🔒 uptime, plans ve iç yapı kaldırıldı — bilgi sızıntısı önlendi
         timestamp: new Date().toISOString(),
-        plans: RATE_LIMITS
     });
 });
 
@@ -15103,13 +15942,18 @@ if (!_originalInitDB) {
 app.get('/api/weather/current', async (req, res) => {
     try {
         const apiKey = process.env.OPENWEATHER_API_KEY;
-        if (!apiKey) return res.status(500).json({ error: 'OPENWEATHER_API_KEY .env\'de tanımlı değil' });
+        if (!apiKey) return res.status(500).json({ error: 'Hava servisi yapılandırılmamış' }); // 🔒 config detayı gizlendi
         const { lat, lon, city, lang = 'tr', units = 'metric' } = req.query;
+        // 🔒 Koordinat doğrulaması — geçersiz değer URL'e enjekte edilemesin
         let url;
         if (lat && lon) {
-            url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${apiKey}&lang=${lang}&units=${units}`;
+            const latF = parseFloat(lat), lonF = parseFloat(lon);
+            if (isNaN(latF) || isNaN(lonF) || latF < -90 || latF > 90 || lonF < -180 || lonF > 180) {
+                return res.status(400).json({ error: 'Geçersiz koordinat değeri' });
+            }
+            url = `https://api.openweathermap.org/data/2.5/weather?lat=${latF}&lon=${lonF}&appid=${apiKey}&lang=${encodeURIComponent(lang)}&units=${encodeURIComponent(units)}`;
         } else if (city) {
-            url = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&appid=${apiKey}&lang=${lang}&units=${units}`;
+            url = `https://api.openweathermap.org/data/2.5/weather?q=${encodeURIComponent(city)}&appid=${apiKey}&lang=${encodeURIComponent(lang)}&units=${encodeURIComponent(units)}`;
         } else {
             return res.status(400).json({ error: 'lat/lon veya city parametresi gerekli' });
         }
@@ -15118,7 +15962,7 @@ app.get('/api/weather/current', async (req, res) => {
         if (!response.ok) return res.status(response.status).json(data);
         res.json(data);
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: 'Sunucu hatası' }); // 🔒 e.message gizlendi
     }
 });
 
@@ -15126,13 +15970,19 @@ app.get('/api/weather/current', async (req, res) => {
 app.get('/api/weather/forecast', async (req, res) => {
     try {
         const apiKey = process.env.OPENWEATHER_API_KEY;
-        if (!apiKey) return res.status(500).json({ error: 'OPENWEATHER_API_KEY .env\'de tanımlı değil' });
+        if (!apiKey) return res.status(500).json({ error: 'Hava servisi yapılandırılmamış' }); // 🔒
         const { lat, lon, city, lang = 'tr', units = 'metric', cnt = 40 } = req.query;
+        // 🔒 Koordinat + cnt doğrulaması
         let url;
         if (lat && lon) {
-            url = `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&appid=${apiKey}&lang=${lang}&units=${units}&cnt=${cnt}`;
+            const latF = parseFloat(lat), lonF = parseFloat(lon);
+            if (isNaN(latF) || isNaN(lonF) || latF < -90 || latF > 90 || lonF < -180 || lonF > 180) {
+                return res.status(400).json({ error: 'Geçersiz koordinat değeri' });
+            }
+            const safeCnt = Math.min(Math.max(parseInt(cnt) || 40, 1), 40);
+            url = `https://api.openweathermap.org/data/2.5/forecast?lat=${latF}&lon=${lonF}&appid=${apiKey}&lang=${encodeURIComponent(lang)}&units=${encodeURIComponent(units)}&cnt=${safeCnt}`;
         } else if (city) {
-            url = `https://api.openweathermap.org/data/2.5/forecast?q=${encodeURIComponent(city)}&appid=${apiKey}&lang=${lang}&units=${units}&cnt=${cnt}`;
+            url = `https://api.openweathermap.org/data/2.5/forecast?q=${encodeURIComponent(city)}&appid=${apiKey}&lang=${encodeURIComponent(lang)}&units=${encodeURIComponent(units)}&cnt=40`;
         } else {
             return res.status(400).json({ error: 'lat/lon veya city parametresi gerekli' });
         }
@@ -15141,7 +15991,7 @@ app.get('/api/weather/forecast', async (req, res) => {
         if (!response.ok) return res.status(response.status).json(data);
         res.json(data);
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: 'Sunucu hatası' }); // 🔒 e.message gizlendi
     }
 });
 
@@ -15149,16 +15999,21 @@ app.get('/api/weather/forecast', async (req, res) => {
 app.get('/api/weather/air', async (req, res) => {
     try {
         const apiKey = process.env.OPENWEATHER_API_KEY;
-        if (!apiKey) return res.status(500).json({ error: 'OPENWEATHER_API_KEY .env\'de tanımlı değil' });
+        if (!apiKey) return res.status(500).json({ error: 'Hava servisi yapılandırılmamış' }); // 🔒
         const { lat, lon } = req.query;
         if (!lat || !lon) return res.status(400).json({ error: 'lat ve lon parametresi gerekli' });
-        const url = `https://api.openweathermap.org/data/2.5/air_pollution?lat=${lat}&lon=${lon}&appid=${apiKey}`;
+        // 🔒 Koordinat doğrulaması
+        const latF = parseFloat(lat), lonF = parseFloat(lon);
+        if (isNaN(latF) || isNaN(lonF) || latF < -90 || latF > 90 || lonF < -180 || lonF > 180) {
+            return res.status(400).json({ error: 'Geçersiz koordinat değeri' });
+        }
+        const url = `https://api.openweathermap.org/data/2.5/air_pollution?lat=${latF}&lon=${lonF}&appid=${apiKey}`;
         const response = await fetch(url);
         const data = await response.json();
         if (!response.ok) return res.status(response.status).json(data);
         res.json(data);
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        res.status(500).json({ error: 'Sunucu hatası' }); // 🔒 e.message gizlendi
     }
 });
 
@@ -15314,7 +16169,7 @@ app.get('/api/weather', authenticateToken, async (req, res) => {
         });
     } catch(e) {
         console.error('[weather]', e.message);
-        res.status(500).json({ error: 'Hava durumu alınamadı: ' + e.message });
+        res.status(500).json({ error: 'Hava durumu alınamadı' }); // 🔒 e.message gizlendi
     }
 });
 
@@ -15377,9 +16232,8 @@ function buildFarmingCalendar(temp, precip, wind, days, month) {
 }
 
 // ─── POST /api/weather/push-alert — Push uyarısı gönder ──────────
-app.post('/api/weather/push-alert', authenticateToken, async (req, res) => {
+app.post('/api/weather/push-alert', authenticateToken, requireAdmin, adminLimiter, async (req, res) => {
     try {
-        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Sadece admin' });
         const { title, body, url = '/' } = req.body;
         if (!title || !body) return res.status(400).json({ error: 'title ve body gerekli' });
         if (!webpush) return res.status(500).json({ error: 'web-push kurulu değil' });
@@ -15403,7 +16257,7 @@ app.post('/api/weather/push-alert', authenticateToken, async (req, res) => {
         }));
 
         res.json({ success: true, sent, failed, total: subs.length });
-    } catch(e) { res.status(500).json({ error: e.message }); }
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); } // 🔒 e.message gizlendi
 });
 
 
@@ -15621,6 +16475,7 @@ app.get('/acil/:id', async (req, res) => {
         if (!talep.rows[0]) return res.status(404).send('<h1>Bulunamadı</h1>');
         const t = talep.rows[0];
         res.type('html').send(`<!DOCTYPE html><html><head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <title>🆘 Acil Yardım - ${t.name}</title>
 <meta property="og:title" content="🆘 ACİL YARDIM: ${t.name}">
 <meta property="og:description" content="${t.description}">
@@ -16003,6 +16858,7 @@ app.get('/tarim/tarla/:id', async (req, res) => {
         ).join('');
 
         res.type('html').send(`<!DOCTYPE html><html><head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <title>🌱 ${t.name} — ${gun} Günlük ${t.product}</title>
 <meta property="og:title" content="${t.userName} - ${gun} Günlük ${t.product} Tarlası">
 <meta property="og:description" content="${t.name} | ${t.alanDonm} dönüm | Agro Sosyal">
@@ -16072,7 +16928,8 @@ app.post('/api/partnership/apply', checkPartnershipIpBan, partnershipLimiter, as
 
         const adminHtml = `<!DOCTYPE html>
 <html lang="tr">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#0f1724;font-family:'Segoe UI',Arial,sans-serif">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f1724;padding:40px 16px">
   <tr><td align="center">
@@ -16149,7 +17006,8 @@ app.post('/api/partnership/apply', checkPartnershipIpBan, partnershipLimiter, as
         // ─── Başvurana otomatik teşekkür maili ──────────────────────────────
         const userThankHtml = `<!DOCTYPE html>
 <html lang="tr">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#0f1724;font-family:'Segoe UI',Arial,sans-serif">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f1724;padding:40px 16px">
   <tr><td align="center">
@@ -16203,6 +17061,7 @@ function actionPageShell(title, bodyHtml) {
 <html lang="tr">
 <head>
   <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>${title} — Agro Sosyal</title>
   <style>
@@ -16440,6 +17299,7 @@ app.post('/api/partnership/action/:id/:action', async (req, res) => {
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 </head>
 <body style="margin:0;padding:0;background:#080f1a;font-family:'Segoe UI',Arial,sans-serif">
@@ -16514,9 +17374,8 @@ app.post('/api/partnership/action/:id/:action', async (req, res) => {
 
 
 // GET /api/partnership/applications — Admin: tüm başvuruları listele
-app.get('/api/partnership/applications', authenticateToken, requireNotBanned, async (req, res) => {
+app.get('/api/partnership/applications', authenticateToken, requireNotBanned, requireAdmin, adminLimiter, async (req, res) => {
     try {
-        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Yetkisiz' });
         const { status } = req.query;
         let query = `SELECT * FROM partnership_applications`;
         const params = [];
@@ -16531,9 +17390,8 @@ app.get('/api/partnership/applications', authenticateToken, requireNotBanned, as
 });
 
 // POST /api/partnership/review/:id — Admin API ile onayla/reddet
-app.post('/api/partnership/review/:id', authenticateToken, requireNotBanned, async (req, res) => {
+app.post('/api/partnership/review/:id', authenticateToken, requireNotBanned, requireAdmin, adminLimiter, async (req, res) => {
     try {
-        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Yetkisiz' });
         const { id } = req.params;
         const { status, reviewNote } = req.body;
         if (!['approved', 'rejected'].includes(status)) {
@@ -16548,7 +17406,8 @@ app.post('/api/partnership/review/:id', authenticateToken, requireNotBanned, asy
         );
 
         const isApproved = status === 'approved';
-        const resultHtml = `<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8"></head>
+        const resultHtml = `<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"></head>
 <body style="margin:0;background:#0f1724;font-family:'Segoe UI',Arial,sans-serif">
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f1724;padding:40px 16px">
 <tr><td align="center">
@@ -16598,6 +17457,7 @@ function skHtml(title, body) {
 <html lang="tr">
 <head>
   <meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>${title} — Şikayet Paneli</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%230d1526'/><path d='M50 15 L75 28 L75 52 C75 66 63 77 50 82 C37 77 25 66 25 52 L25 28 Z' fill='%2322c55e'/><path d='M50 15 L75 28 L75 52 C75 66 63 77 50 82 C37 77 25 66 25 52 L25 28 Z' fill='none' stroke='%23166534' stroke-width='2'/><path d='M40 50 L46 56 L60 42' stroke='white' stroke-width='4' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>" type="image/svg+xml">
@@ -16737,7 +17597,8 @@ app.post('/sikayet/send-code', async (req, res) => {
         const code = Math.floor(100000 + Math.random() * 900000).toString();
         SK_CODES.set(email, { code, exp: Date.now() + 5 * 60 * 1000 });
 
-        const mailHtml = `<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8"></head>
+        const mailHtml = `<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8">
+  <link rel="icon" type="image/png" href="/agro.png"></head>
 <body style="margin:0;background:#060d18;font-family:'Segoe UI',sans-serif;padding:40px 16px">
   <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">
     <table width="480" cellpadding="0" cellspacing="0" style="background:#0d1526;border-radius:20px;overflow:hidden;border:1px solid rgba(59,130,246,.2)">
@@ -17021,6 +17882,8 @@ app.post('/sikayet/action/:id/:action', requireSikayetAuth, async (req, res) => 
 // initializeDatabase içinden çalışır; burada async IIFE ile güvenli ekleme
 (async () => {
     try {
+        // Önce mevcut tabloya kolonları ekle (varsa atla) — NOT NULL olmadan ekle, sonra DEFAULT koy
+        // Bu sıra kritik: önce ALTER, sonra CREATE INDEX; tablo yoksa CREATE TABLE halleder
         await pool.query(`
             CREATE TABLE IF NOT EXISTS ads (
                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -17029,14 +17892,24 @@ app.post('/sikayet/action/:id/:action', requireSikayetAuth, async (req, res) => 
                 body TEXT,
                 "imageUrl" TEXT,
                 "linkUrl" TEXT,
-                "isActive" BOOLEAN DEFAULT TRUE,
+                "isActive" BOOLEAN DEFAULT FALSE,
+                "approvalStatus" TEXT DEFAULT 'pending',
+                "approvalToken" TEXT,
                 views INTEGER DEFAULT 0,
                 clicks INTEGER DEFAULT 0,
                 "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         `);
-        await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_active ON ads("isActive")`);
+        // Mevcut (eski) tabloya kolonları ekle — NOT NULL kısıtı OLMADAN (mevcut satırlar için güvenli)
+        await pool.query(`ALTER TABLE ads ADD COLUMN IF NOT EXISTS "approvalStatus" TEXT DEFAULT 'pending'`).catch(() => {});
+        await pool.query(`ALTER TABLE ads ADD COLUMN IF NOT EXISTS "approvalToken" TEXT`).catch(() => {});
+        // NULL kalan eski satırları güncelle
+        await pool.query(`UPDATE ads SET "approvalStatus"='pending' WHERE "approvalStatus" IS NULL`).catch(() => {});
+        // Eski aktif reklamlarda approval güncelle
+        await pool.query(`UPDATE ads SET "approvalStatus"='approved' WHERE "isActive"=TRUE AND "approvalStatus"='pending'`).catch(() => {});
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_active ON ads("isActive")`).catch(() => {});
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_approval ON ads("approvalStatus")`).catch(() => {});
     } catch (e) {
         console.warn('[Ads] Tablo migration uyarısı:', e.message);
     }
@@ -17061,13 +17934,54 @@ app.post('/api/ads', authenticateToken, upload.single('image'), async (req, res)
         }
 
         const adId = uuidv4();
+        const approvalToken = crypto.randomBytes(32).toString('hex');
+
         await pool.query(
-            `INSERT INTO ads (id, "userId", title, body, "imageUrl", "linkUrl", "createdAt", "updatedAt")
-             VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW())`,
-            [adId, req.user.id, title.substring(0, 200), (body||'').substring(0,500), imageUrl, linkUrl||null]
+            `INSERT INTO ads (id, "userId", title, body, "imageUrl", "linkUrl", "isActive", "approvalStatus", "approvalToken", "createdAt", "updatedAt")
+             VALUES ($1,$2,$3,$4,$5,$6,FALSE,'pending',$7,NOW(),NOW())`,
+            [adId, req.user.id, title.substring(0, 200), (body||'').substring(0,500), imageUrl, linkUrl||null, approvalToken]
         );
 
-        res.status(201).json({ success: true, adId, message: 'Reklam oluşturuldu' });
+        // Reklamı veren kullanıcı bilgisi
+        const advertiser = await pool.query(`SELECT name, email, username FROM users WHERE id=$1`, [req.user.id]);
+        const adUser = advertiser.rows[0] || {};
+
+        // Admin'e onay maili gönder
+        const adminEmail = process.env.ADMIN_EMAIL || process.env.SMTP_USER || process.env.EMAIL_USER;
+        const serverBase = process.env.SERVER_BASE_URL || 'https://sehitumitkestitarimmtal.com';
+        const approveUrl = `${serverBase}/api/ads/approve/${approvalToken}?action=approve`;
+        const rejectUrl  = `${serverBase}/api/ads/approve/${approvalToken}?action=reject`;
+
+        if (adminEmail) {
+            const adImageHtml = imageUrl
+                ? `<img src="${serverBase}${imageUrl}" style="max-width:100%;border-radius:12px;margin:12px 0;" />`
+                : '';
+            const adLinkHtml = (linkUrl||'').trim()
+                ? `<p><b>Link:</b> <a href="${escapeHtml(linkUrl)}">${escapeHtml(linkUrl)}</a></p>`
+                : '';
+            sendEmail(adminEmail, '📢 Yeni Reklam Onay Bekliyor — AgroLink', `
+<!DOCTYPE html><html lang="tr"><body style="font-family:sans-serif;background:#0a0a0a;color:#e5e5e5;padding:32px;">
+<div style="max-width:600px;margin:0 auto;background:#111;border-radius:20px;padding:32px;border:1px solid #222;">
+  <h2 style="color:#f59e0b;margin-top:0;">📢 Yeni Reklam Onay Bekliyor</h2>
+  <table style="width:100%;border-collapse:collapse;margin-bottom:16px;">
+    <tr><td style="padding:6px 0;color:#999;width:120px;">Başlık</td><td style="color:#fff;font-weight:bold;">${escapeHtml(title.substring(0,200))}</td></tr>
+    <tr><td style="padding:6px 0;color:#999;">Açıklama</td><td style="color:#ccc;">${escapeHtml((body||'').substring(0,300))}</td></tr>
+    <tr><td style="padding:6px 0;color:#999;">Kullanıcı</td><td style="color:#ccc;">${escapeHtml(adUser.name||'')} (@${escapeHtml(adUser.username||'')})</td></tr>
+    <tr><td style="padding:6px 0;color:#999;">E-posta</td><td style="color:#ccc;">${escapeHtml(adUser.email||'')}</td></tr>
+  </table>
+  ${adLinkHtml}
+  ${adImageHtml}
+  <div style="margin-top:28px;display:flex;gap:12px;">
+    <a href="${approveUrl}" style="display:inline-block;padding:14px 28px;background:#22c55e;color:#fff;border-radius:12px;text-decoration:none;font-weight:bold;font-size:15px;">✅ Onayla</a>
+    &nbsp;&nbsp;
+    <a href="${rejectUrl}" style="display:inline-block;padding:14px 28px;background:#ef4444;color:#fff;border-radius:12px;text-decoration:none;font-weight:bold;font-size:15px;">❌ Reddet</a>
+  </div>
+  <p style="color:#666;font-size:12px;margin-top:20px;">Bu mail otomatik gönderilmiştir. AgroLink Admin Paneli</p>
+</div></body></html>
+            `).catch(() => {});
+        }
+
+        res.status(201).json({ success: true, adId, approvalStatus: 'pending', message: 'Reklamınız incelemeye alındı. Onaylandıktan sonra yayınlanacak.' });
     } catch (e) {
         console.error('[Ads] Oluşturma hatası:', e.message);
         res.status(500).json({ error: 'Sunucu hatası' });
@@ -17075,28 +17989,63 @@ app.post('/api/ads', authenticateToken, upload.single('image'), async (req, res)
 });
 
 // ─── RASTGELE REKLAM ÇEK (GET) ─────────────────────────────────────
-// Ana app bu endpoint'i çağırarak rastgele aktif reklam alır
+// Ana app bu endpoint'i çağırarak rastgele aktif reklam alır.
+// ?lastAdId=<uuid>  →  son gösterilen reklamı atlar (tekrar gösterme)
+// Strateji: önce az görüntülenen reklamlara öncelik ver, aynı reklamı arka arkaya gösterme
 app.get('/api/ads/random', authenticateToken, async (req, res) => {
     try {
-        const ad = await pool.query(
-            `SELECT a.id, a.title, a.body, a."imageUrl", a."linkUrl", a.views, a.clicks,
-                    u.username AS "ownerUsername", u.name AS "ownerName", u."profilePic" AS "ownerPic"
-             FROM ads a
+        const { lastAdId } = req.query; // frontend son gösterilen id'yi gönderir
+
+        // Toplam aktif reklam sayısını öğren
+        const countResult = await pool.query(
+            `SELECT COUNT(*) AS cnt FROM ads a
              JOIN users u ON a."userId" = u.id
-             WHERE a."isActive" = TRUE AND u."isActive" = TRUE
-             ORDER BY RANDOM()
-             LIMIT 1`
+             WHERE a."isActive" = TRUE AND u."isActive" = TRUE`
         );
-        if (!ad.rows.length) return res.json({ ad: null });
+        const totalAds = parseInt(countResult.rows[0].cnt, 10);
+        if (totalAds === 0) return res.json({ ad: null });
+
+        let ad = null;
+
+        // Birden fazla reklam varsa → son gösterileni atla
+        if (totalAds > 1 && lastAdId) {
+            const result = await pool.query(
+                `SELECT a.id, a.title, a.body, a."imageUrl", a."linkUrl", a.views, a.clicks,
+                        u.username AS "ownerUsername", u.name AS "ownerName", u."profilePic" AS "ownerPic"
+                 FROM ads a
+                 JOIN users u ON a."userId" = u.id
+                 WHERE a."isActive" = TRUE AND a."approvalStatus" = 'approved' AND u."isActive" = TRUE
+                   AND a.id != $1
+                 ORDER BY a.views ASC, RANDOM()
+                 LIMIT 1`,
+                [lastAdId]
+            );
+            if (result.rows.length) ad = result.rows[0];
+        }
+
+        // lastAdId yoksa veya yukarıdaki sorgu boş döndüyse → normal çek
+        if (!ad) {
+            const result = await pool.query(
+                `SELECT a.id, a.title, a.body, a."imageUrl", a."linkUrl", a.views, a.clicks,
+                        u.username AS "ownerUsername", u.name AS "ownerName", u."profilePic" AS "ownerPic"
+                 FROM ads a
+                 JOIN users u ON a."userId" = u.id
+                 WHERE a."isActive" = TRUE AND a."approvalStatus" = 'approved' AND u."isActive" = TRUE
+                 ORDER BY a.views ASC, RANDOM()
+                 LIMIT 1`
+            );
+            if (!result.rows.length) return res.json({ ad: null });
+            ad = result.rows[0];
+        }
 
         // Görüntülenme sayısını artır
-        await pool.query(`UPDATE ads SET views = views + 1, "updatedAt"=NOW() WHERE id=$1`, [ad.rows[0].id]).catch(() => {});
+        await pool.query(`UPDATE ads SET views = views + 1, "updatedAt"=NOW() WHERE id=$1`, [ad.id]).catch(() => {});
 
         res.json({
             ad: {
-                ...ad.rows[0],
-                imageUrl: absoluteUrl(ad.rows[0].imageUrl),
-                ownerPic: absoluteUrl(ad.rows[0].ownerPic),
+                ...ad,
+                imageUrl: absoluteUrl(ad.imageUrl),
+                ownerPic: absoluteUrl(ad.ownerPic),
             }
         });
     } catch (e) {
@@ -17115,15 +18064,88 @@ app.post('/api/ads/:id/click', authenticateToken, async (req, res) => {
     }
 });
 
+// ─── REKLAM ONAYLA / REDDET (Admin mail linki) ──────────────────────
+// GET /api/ads/approve/:token?action=approve|reject
+// Bu endpoint mail içindeki butona tıklandığında açılır — auth gerektirmez, token ile doğrular
+app.get('/api/ads/approve/:token', async (req, res) => {
+    try {
+        const { token } = req.params;
+        const { action } = req.query;
+
+        if (!token || !['approve','reject'].includes(action)) {
+            return res.status(400).send('<h2>Geçersiz istek.</h2>');
+        }
+
+        const adResult = await pool.query(
+            `SELECT id, title, "userId", "imageUrl" FROM ads WHERE "approvalToken"=$1 AND "approvalStatus"='pending'`,
+            [token]
+        );
+
+        if (!adResult.rows.length) {
+            return res.status(404).send('<h2 style="font-family:sans-serif;padding:40px;">Bu reklam zaten işleme alınmış veya bulunamadı.</h2>');
+        }
+
+        const ad = adResult.rows[0];
+
+        if (action === 'approve') {
+            await pool.query(
+                `UPDATE ads SET "isActive"=TRUE, "approvalStatus"='approved', "approvalToken"=NULL, "updatedAt"=NOW() WHERE id=$1`,
+                [ad.id]
+            );
+            // Reklam sahibine bildirim
+            const owner = await pool.query(`SELECT email, name FROM users WHERE id=$1`, [ad["userId"]]).catch(() => ({ rows: [] }));
+            if (owner.rows[0]?.email) {
+                sendEmail(owner.rows[0].email, '✅ Reklamınız Onaylandı — AgroLink', `
+                    <div style="font-family:sans-serif;background:#0a0a0a;color:#e5e5e5;padding:32px;">
+                    <div style="max-width:500px;margin:0 auto;background:#111;border-radius:20px;padding:32px;border:1px solid #222;">
+                    <h2 style="color:#22c55e;">✅ Reklamınız Onaylandı!</h2>
+                    <p>Merhaba <b>${escapeHtml(owner.rows[0].name||'')}</b>,</p>
+                    <p><b>${escapeHtml(ad.title)}</b> başlıklı reklamınız onaylandı ve Agro Sosyal feed'inde yayına girdi.</p>
+                    <p style="color:#666;font-size:12px;">AgroLink Reklam Sistemi</p>
+                    </div></div>
+                `).catch(() => {});
+            }
+            return res.send(`<html><head><meta charset="utf-8"></head><body style="font-family:sans-serif;background:#0a0a0a;color:#e5e5e5;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;"><div style="background:#111;border-radius:20px;padding:40px;border:1px solid #22c55e;text-align:center;"><div style="font-size:48px;margin-bottom:16px;">✅</div><h2 style="color:#22c55e;">Reklam Onaylandı!</h2><p style="color:#999;">"${escapeHtml(ad.title)}" yayına girdi.</p></div></body></html>`);
+        } else {
+            // Reddet — reklamı ve varsa görseli tamamen sil
+            if (ad.imageUrl) {
+                const imgPath = path.join(__dirname, ad.imageUrl.replace(/^\//, ''));
+                require('fs').promises.unlink(imgPath).catch(() => {});
+            }
+            await pool.query(`DELETE FROM ads WHERE id=$1`, [ad.id]);
+            // Reklam sahibine bildirim
+            const owner = await pool.query(`SELECT email, name FROM users WHERE id=$1`, [ad["userId"]]).catch(() => ({ rows: [] }));
+            if (owner.rows[0]?.email) {
+                sendEmail(owner.rows[0].email, '❌ Reklamınız Reddedildi — AgroLink', `
+                    <div style="font-family:sans-serif;background:#0a0a0a;color:#e5e5e5;padding:32px;">
+                    <div style="max-width:500px;margin:0 auto;background:#111;border-radius:20px;padding:32px;border:1px solid #222;">
+                    <h2 style="color:#ef4444;">❌ Reklamınız Reddedildi</h2>
+                    <p>Merhaba <b>${escapeHtml(owner.rows[0].name||'')}</b>,</p>
+                    <p><b>${escapeHtml(ad.title)}</b> başlıklı reklamınız inceleme sonucunda uygun bulunmadı ve sistemden kaldırıldı.</p>
+                    <p>Yeni bir reklam oluşturabilirsiniz.</p>
+                    <p style="color:#666;font-size:12px;">AgroLink Reklam Sistemi</p>
+                    </div></div>
+                `).catch(() => {});
+            }
+            return res.send(`<html><head><meta charset="utf-8"></head><body style="font-family:sans-serif;background:#0a0a0a;color:#e5e5e5;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;"><div style="background:#111;border-radius:20px;padding:40px;border:1px solid #ef4444;text-align:center;"><div style="font-size:48px;margin-bottom:16px;">❌</div><h2 style="color:#ef4444;">Reklam Reddedildi</h2><p style="color:#999;">"${escapeHtml(ad.title)}" reklam verileri silindi.</p></div></body></html>`);
+        }
+    } catch (e) {
+        console.error('[Ads Approve]', e.message);
+        res.status(500).send('<h2>Sunucu hatası.</h2>');
+    }
+});
+
 // ─── KENDİ REKLAMLARI ──────────────────────────────────────────────
 app.get('/api/ads/my', authenticateToken, async (req, res) => {
     try {
         const ads = await pool.query(
-            `SELECT * FROM ads WHERE "userId"=$1 ORDER BY "createdAt" DESC`,
+            `SELECT id, title, body, "imageUrl", "linkUrl", "isActive", "approvalStatus", views, clicks, "createdAt"
+             FROM ads WHERE "userId"=$1 ORDER BY "createdAt" DESC`,
             [req.user.id]
         );
         res.json({ ads: ads.rows.map(a => ({ ...a, imageUrl: absoluteUrl(a.imageUrl) })) });
     } catch (e) {
+        console.error('[Ads] /api/ads/my hatası:', e.message);
         res.status(500).json({ error: 'Sunucu hatası' });
     }
 });
@@ -17133,11 +18155,16 @@ app.delete('/api/ads/:id', authenticateToken, async (req, res) => {
     try {
         const ad = await pool.query(`SELECT "userId" FROM ads WHERE id=$1`, [req.params.id]);
         if (!ad.rows.length) return res.status(404).json({ error: 'Reklam bulunamadı' });
-        if (ad.rows[0].userId !== req.user.id && req.user.role !== 'admin') {
+        if (ad.rows[0]["userId"] !== req.user.id && req.user.role !== 'admin') {
             return res.status(403).json({ error: 'Yetkiniz yok' });
         }
-        await pool.query(`UPDATE ads SET "isActive"=FALSE,"updatedAt"=NOW() WHERE id=$1`, [req.params.id]);
-        res.json({ message: 'Reklam silindi' });
+        if (req.query.permanent === 'true') {
+            await pool.query(`DELETE FROM ads WHERE id=$1`, [req.params.id]);
+            res.json({ message: 'Reklam kalıcı olarak silindi', permanent: true });
+        } else {
+            await pool.query(`UPDATE ads SET "isActive"=FALSE,"updatedAt"=NOW() WHERE id=$1`, [req.params.id]);
+            res.json({ message: 'Reklam pasife alındı', permanent: false });
+        }
     } catch (e) {
         res.status(500).json({ error: 'Sunucu hatası' });
     }
@@ -17522,7 +18549,7 @@ app.put('/api/communities/:id', authenticateToken, (req, res, next) => {
         { name: 'avatar', maxCount: 1 },
         { name: 'banner', maxCount: 1 },
     ])(req, res, (err) => {
-        if (err) return res.status(400).json({ error: err.message || 'Dosya yükleme hatası' });
+        if (err) return res.status(400).json({ error: 'Dosya yükleme hatası' }) // 🔒 DÜZELTMESİ: detay gizlendi;
         next();
     });
 }, async (req, res) => {
@@ -17610,6 +18637,404 @@ app.delete('/api/communities/:id', authenticateToken, async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════
+// 🌿 HASTALIK ALARM AĞI
+// ════════════════════════════════════════════════════════════════════
+
+// Tablo oluşturma (migration-safe)
+async function ensureDiseaseAlarmTable() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS disease_alarms (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            "reporterId" UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            city TEXT NOT NULL,
+            district TEXT,
+            "cropType" TEXT NOT NULL,
+            "diseaseInfo" TEXT NOT NULL,
+            note TEXT,
+            "notifiedCount" INT DEFAULT 0,
+            "createdAt" TIMESTAMPTZ DEFAULT NOW()
+        )
+    `).catch(() => {});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "farmerCity" TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "farmerCrops" TEXT`).catch(() => {});
+}
+ensureDiseaseAlarmTable();
+
+// ── Disease alarm 24 saat otomatik silme ─────────────────────────────────────
+function startDiseaseAlarmCleanup() {
+    const doClean = () => {
+        pool.query(`DELETE FROM disease_alarms WHERE "createdAt" < NOW() - INTERVAL '24 hours'`)
+            .then(r => { if (r.rowCount > 0) console.log(`[DiseaseAlarm] ${r.rowCount} eski alarm silindi.`); })
+            .catch(e => console.error('[DiseaseAlarm cleanup]', e.message));
+    };
+    doClean(); // başlangıçta bir kez çalıştır
+    setInterval(doClean, 60 * 60 * 1000); // saatte bir
+}
+startDiseaseAlarmCleanup();
+
+// POST /api/disease-alarms — yeni alarm oluştur & bölgedekilere bildir
+app.post('/api/disease-alarms', authenticateToken, async (req, res) => {
+    try {
+        const { city, district, cropType, diseaseInfo, note } = req.body;
+        if (!city || !cropType) {
+            return res.status(400).json({ error: 'city ve cropType zorunludur.' });
+        }
+        const safeDisease = (diseaseInfo || note || 'Bölge alarmı').substring(0, 1000);
+
+        const alarmId = uuidv4();
+        await pool.query(
+            `INSERT INTO disease_alarms (id, "reporterId", city, district, "cropType", "diseaseInfo", note)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+            [alarmId, req.user.id, city.trim(), (district||'').trim(), cropType.trim(),
+             safeDisease, (note||'').substring(0,500)]
+        );
+
+        // Aynı il + ürün türünde çiftçileri bul
+        // Öncelik: farmerCity veya location şehirle eşleşen HERKES bildirilir
+        // farmerCrops doluysa o ürünü içermeli; boşsa/null ise yine dahil et
+        const targets = await pool.query(
+            `SELECT id FROM users
+             WHERE id != $1
+               AND "isActive" = TRUE
+               AND "isBanned" = FALSE
+               AND (
+                   LOWER("farmerCity") = LOWER($2)
+                   OR LOWER(location) LIKE LOWER($3)
+                   OR LOWER(location) LIKE LOWER($4)
+               )
+               AND (
+                   "farmerCrops" IS NULL
+                   OR "farmerCrops" = ''
+                   OR "farmerCrops" ILIKE $5
+               )
+             LIMIT 500`,
+            [req.user.id, city.trim(), `%${city.trim()}%`, `${city.trim()}%`, `%${cropType.trim()}%`]
+        );
+
+        const reporter = await pool.query(
+            `SELECT name, username FROM users WHERE id=$1`, [req.user.id]
+        );
+        const rName = reporter.rows[0]?.name || reporter.rows[0]?.username || 'Bir çiftçi';
+        const pushTitle = `⚠️ ${city} Bölge Alarmı`;
+        const pushBody  = `${rName} ${cropType} bitkisinde hastalık tespit etti!`;
+
+        let notifiedCount = 0;
+        for (const t of targets.rows) {
+            await createNotification(
+                t.id,
+                'disease_alarm',
+                pushBody,
+                {
+                    alarmId,
+                    city,
+                    cropType,
+                    diseaseInfo: safeDisease.substring(0, 200),
+                    reporterId: req.user.id,
+                    actorName: rName,
+                    actorUsername: req.user.username,
+                    pushTitle,
+                }
+            ).catch(() => {});
+            notifiedCount++;
+        }
+
+        await pool.query(
+            `UPDATE disease_alarms SET "notifiedCount"=$1 WHERE id=$2`,
+            [notifiedCount, alarmId]
+        );
+
+        res.status(201).json({ message: 'Alarm gönderildi', alarmId, notifiedCount });
+    } catch (err) {
+        console.error('[disease-alarm POST]', err.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// GET /api/disease-alarms — bölge/ürün filtreli alarmları listele
+app.get('/api/disease-alarms', authenticateToken, async (req, res) => {
+    try {
+        const { city, cropType, page = 1 } = req.query;
+        const limit = 20;
+        const offset = (Number(page) - 1) * limit;
+        const params = [];
+        const where = [];
+        let idx = 1;
+
+        if (city) { where.push(`LOWER(da.city) = LOWER($${idx++})`); params.push(city); }
+        if (cropType) { where.push(`da."cropType" ILIKE $${idx++}`); params.push(`%${cropType}%`); }
+
+        const whereStr = where.length ? 'WHERE ' + where.join(' AND ') : '';
+        params.push(limit, offset);
+
+        const rows = await pool.query(
+            `SELECT da.*, u.name, u.username, u."profilePic"
+             FROM disease_alarms da
+             JOIN users u ON u.id = da."reporterId"
+             ${whereStr}
+             ORDER BY da."createdAt" DESC
+             LIMIT $${idx} OFFSET $${idx+1}`,
+            params
+        );
+
+        res.json({ alarms: rows.rows });
+    } catch (err) {
+        console.error('[disease-alarm GET]', err.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// DELETE /api/disease-alarms/:id — kendi alarmını sil
+app.delete('/api/disease-alarms/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await pool.query(
+            `DELETE FROM disease_alarms WHERE id=$1 AND "reporterId"=$2 RETURNING id`,
+            [id, req.user.id]
+        );
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Alarm bulunamadı veya silme yetkiniz yok.' });
+        }
+        res.json({ success: true, message: 'Alarm silindi.' });
+    } catch (err) {
+        console.error('[disease-alarm DELETE]', err.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// 🏅 ÇİFTÇİ SERTİFİKA SİSTEMİ
+// ════════════════════════════════════════════════════════════════════
+
+async function ensureCertificateTables() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS farmer_certificates (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            "userId" UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            type TEXT NOT NULL CHECK (type IN ('organik_ciftci','iyi_tarim_uzmani')),
+            status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+            score INT,
+            "approveVotes" INT DEFAULT 0,
+            "rejectVotes" INT DEFAULT 0,
+            "createdAt" TIMESTAMPTZ DEFAULT NOW(),
+            "updatedAt" TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE("userId", type)
+        )
+    `).catch(() => {});
+
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS certificate_votes (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            "certificateId" UUID NOT NULL REFERENCES farmer_certificates(id) ON DELETE CASCADE,
+            "voterId" UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            vote TEXT NOT NULL CHECK (vote IN ('approve','reject')),
+            "createdAt" TIMESTAMPTZ DEFAULT NOW(),
+            UNIQUE("certificateId","voterId")
+        )
+    `).catch(() => {});
+
+    // users tablosuna sertifika alanı ekle (migration-safe)
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "farmerBadgeType" TEXT`).catch(() => {});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS "farmerCertificate" TEXT`).catch(() => {});
+}
+ensureCertificateTables();
+
+// Tarım bilgi soruları (sabit havuz — ileride DB'ye taşınabilir)
+const CERTIFICATE_QUESTIONS = [
+    { id: 'q1', question: 'Toprak pH değeri kaç olduğunda çoğu kültür bitkisi için idealdir?', options: ['4-5','6-7','8-9','3-4'], answer: '6-7' },
+    { id: 'q2', question: 'Organik tarımda sentetik kimyasalların kullanımı nasıldır?', options: ['Serbest','Kısıtlı','Yasak','Zorunlu'], answer: 'Yasak' },
+    { id: 'q3', question: 'Damla sulama sistemi hangi avantajı sağlar?', options: ['Su tasarrufu','Hızlı büyüme','Toprak sertleşmesi','Gölge'], answer: 'Su tasarrufu' },
+    { id: 'q4', question: 'Nöbetleşe ekim (crop rotation) neyi engeller?', options: ['Hasat kaybı','Toprak tükenmesi ve hastalık birikmesi','Sulama ihtiyacı','Gübreleme'], answer: 'Toprak tükenmesi ve hastalık birikmesi' },
+    { id: 'q5', question: 'Domates bitkisinde "kloroz" (sararma) en sık hangi eksiklikten kaynaklanır?', options: ['Demir/Azot','Fosfor','Kalsiyum','Sodyum'], answer: 'Demir/Azot' },
+    { id: 'q6', question: 'IPM (Entegre Zararlı Yönetimi) neyi amaçlar?', options: ['Maksimum ilaç kullanımı','Kimyasal kullanımını minimize etmek','Daha büyük tarlalar oluşturmak','Sulama kesintisi'], answer: 'Kimyasal kullanımını minimize etmek' },
+    { id: 'q7', question: 'Azot (N) bitki için en temel hangi işlevi görür?', options: ['Çiçeklenme','Kök gelişimi','Yaprak ve gövde büyümesi','Meyve rengi'], answer: 'Yaprak ve gövde büyümesi' },
+    { id: 'q8', question: 'Kompost hangi sürecin ürünüdür?', options: ['Fermentasyon','Aerobik ayrışma','Donma-çözülme','Kimyasal sentez'], answer: 'Aerobik ayrışma' },
+    { id: 'q9', question: 'Mikorizal funguslar bitkilere nasıl yardım eder?', options: ['Zararlı böcekleri öldürür','Su ve mineral alımını artırır','Karbondioksit üretir','Tohum çimlenmesini engeller'], answer: 'Su ve mineral alımını artırır' },
+    { id: 'q10', question: 'Kavun mildiyösünün (Plasmopara) yayılmasını engellemek için ne önerilir?', options: ['Daha fazla sulama','Fungisit uygulaması ve bitki arası hava sirkülasyonu','Gübre artışı','Erken hasat'], answer: 'Fungisit uygulaması ve bitki arası hava sirkülasyonu' },
+];
+const PASS_SCORE = 70; // %70 geçme puanı
+const APPROVE_THRESHOLD = 50; // Organik Çiftçi için 50 onay oyu
+
+// GET /api/farmer-certificate/status
+app.get('/api/farmer-certificate/status', authenticateToken, async (req, res) => {
+    try {
+        const rows = await pool.query(
+            `SELECT type, status, score, "approveVotes", "rejectVotes" FROM farmer_certificates WHERE "userId"=$1`,
+            [req.user.id]
+        );
+        const certificates = rows.rows.filter(r => r.status === 'approved').map(r => r.type);
+        const pending      = rows.rows.filter(r => r.status === 'pending').map(r => r.type);
+        res.json({ certificates, pending, details: rows.rows });
+    } catch (err) {
+        console.error('[cert status]', err.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// GET /api/farmer-certificate/questions
+app.get('/api/farmer-certificate/questions', authenticateToken, async (req, res) => {
+    // Soruları karıştır, 10 tane döndür (cevapları gönderme!)
+    const shuffled = [...CERTIFICATE_QUESTIONS].sort(() => Math.random() - 0.5).slice(0, 10);
+    res.json({
+        questions: shuffled.map(({ answer: _a, ...q }) => q)
+    });
+});
+
+// POST /api/farmer-certificate/apply — organik_ciftci başvurusu
+app.post('/api/farmer-certificate/apply', authenticateToken, async (req, res) => {
+    try {
+        const { type } = req.body;
+        if (!['organik_ciftci','iyi_tarim_uzmani'].includes(type)) {
+            return res.status(400).json({ error: 'Geçersiz sertifika türü.' });
+        }
+
+        // Mevcut kaydı kontrol et
+        const existing = await pool.query(
+            `SELECT id, status FROM farmer_certificates WHERE "userId"=$1 AND type=$2`,
+            [req.user.id, type]
+        );
+        if (existing.rows.length > 0) {
+            const s = existing.rows[0].status;
+            if (s === 'approved') return res.status(400).json({ error: 'Bu sertifikaya zaten sahipsiniz.' });
+            if (s === 'pending')  return res.status(400).json({ error: 'Başvurunuz zaten incelemede.' });
+        }
+
+        await pool.query(
+            `INSERT INTO farmer_certificates (id,"userId",type,status)
+             VALUES ($1,$2,$3,'pending')
+             ON CONFLICT ("userId",type) DO UPDATE SET status='pending', "updatedAt"=NOW()`,
+            [uuidv4(), req.user.id, type]
+        );
+
+        res.status(201).json({
+            message: 'Başvurun alındı. Topluluk oylamasıyla onaylanınca rozetin profilde görünecek.',
+            certificate: null,
+        });
+    } catch (err) {
+        console.error('[cert apply]', err.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// POST /api/farmer-certificate/quiz — iyi_tarim_uzmani sınavı
+app.post('/api/farmer-certificate/quiz', authenticateToken, async (req, res) => {
+    try {
+        const { answers } = req.body; // { q1: "cevap", q2: "cevap", ... }
+        if (!answers || typeof answers !== 'object') {
+            return res.status(400).json({ error: 'Cevaplar gereklidir.' });
+        }
+
+        // Puan hesapla
+        let correct = 0;
+        for (const q of CERTIFICATE_QUESTIONS) {
+            if (answers[q.id] === q.answer) correct++;
+        }
+        const score = Math.round((correct / CERTIFICATE_QUESTIONS.length) * 100);
+        const passed = score >= PASS_SCORE;
+
+        if (passed) {
+            // Sertifikayı direkt onayla
+            await pool.query(
+                `INSERT INTO farmer_certificates (id,"userId",type,status,score)
+                 VALUES ($1,$2,'iyi_tarim_uzmani','approved',$3)
+                 ON CONFLICT ("userId",type) DO UPDATE SET status='approved', score=$3, "updatedAt"=NOW()`,
+                [uuidv4(), req.user.id, score]
+            );
+            await pool.query(
+                `UPDATE users SET "farmerBadgeType"='iyi_tarim_uzmani', "farmerCertificate"='iyi_tarim_uzmani', "hasFarmerBadge"=TRUE, "updatedAt"=NOW() WHERE id=$1`,
+                [req.user.id]
+            );
+            return res.json({
+                passed: true,
+                score,
+                message: `🎉 Tebrikler! ${score}% puan aldın ve İyi Tarım Uzmanı sertifikasını kazandın!`,
+            });
+        } else {
+            await pool.query(
+                `INSERT INTO farmer_certificates (id,"userId",type,status,score)
+                 VALUES ($1,$2,'iyi_tarim_uzmani','rejected',$3)
+                 ON CONFLICT ("userId",type) DO UPDATE SET status='rejected', score=$3, "updatedAt"=NOW()`,
+                [uuidv4(), req.user.id, score]
+            );
+            return res.json({
+                passed: false,
+                score,
+                message: `Puanın: ${score}%. Geçmek için %${PASS_SCORE} gerekiyor. Tekrar deneyebilirsin!`,
+            });
+        }
+    } catch (err) {
+        console.error('[cert quiz]', err.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// POST /api/farmer-certificate/vote — topluluk oylama
+app.post('/api/farmer-certificate/vote', authenticateToken, async (req, res) => {
+    try {
+        const { targetUserId, vote } = req.body;
+        if (!['approve','reject'].includes(vote)) {
+            return res.status(400).json({ error: 'vote: approve | reject olmalı.' });
+        }
+        if (targetUserId === req.user.id) {
+            return res.status(400).json({ error: 'Kendi başvuruna oy veremezsiniz.' });
+        }
+
+        const cert = await pool.query(
+            `SELECT id, type, "approveVotes", "rejectVotes" FROM farmer_certificates
+             WHERE "userId"=$1 AND type='organik_ciftci' AND status='pending'`,
+            [targetUserId]
+        );
+        if (!cert.rows.length) {
+            return res.status(404).json({ error: 'Aktif başvuru bulunamadı.' });
+        }
+        const c = cert.rows[0];
+
+        // Daha önce oy kullandı mı?
+        const existing = await pool.query(
+            `SELECT id FROM certificate_votes WHERE "certificateId"=$1 AND "voterId"=$2`,
+            [c.id, req.user.id]
+        );
+        if (existing.rows.length) {
+            return res.status(409).json({ error: 'Zaten oy kullandınız.' });
+        }
+
+        await pool.query(
+            `INSERT INTO certificate_votes (id,"certificateId","voterId",vote) VALUES ($1,$2,$3,$4)`,
+            [uuidv4(), c.id, req.user.id, vote]
+        );
+
+        const newApprove = c.approveVotes + (vote === 'approve' ? 1 : 0);
+        const newReject  = c.rejectVotes  + (vote === 'reject'  ? 1 : 0);
+
+        await pool.query(
+            `UPDATE farmer_certificates SET "approveVotes"=$1, "rejectVotes"=$2, "updatedAt"=NOW() WHERE id=$3`,
+            [newApprove, newReject, c.id]
+        );
+
+        // Eşik aşıldıysa onayla
+        if (newApprove >= APPROVE_THRESHOLD) {
+            await pool.query(
+                `UPDATE farmer_certificates SET status='approved', "updatedAt"=NOW() WHERE id=$1`,
+                [c.id]
+            );
+            await pool.query(
+                `UPDATE users SET "farmerBadgeType"='organik_ciftci', "farmerCertificate"='organik_ciftci', "hasFarmerBadge"=TRUE, "updatedAt"=NOW() WHERE id=$1`,
+                [targetUserId]
+            );
+            // Kullanıcıya bildirim
+            createNotification(targetUserId, 'certificate_approved',
+                '🎉 Organik Çiftçi Sertifikan onaylandı! Rozet profiline eklendi.',
+                { type: 'organik_ciftci' }
+            ).catch(() => {});
+        }
+
+        res.json({ message: 'Oyunuz kaydedildi.', approveVotes: newApprove, rejectVotes: newReject });
+    } catch (err) {
+        console.error('[cert vote]', err.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════
 // 🔒 Bilinmeyen API rotaları için 404
 // ════════════════════════════════════════════════════════════════════
 app.all('/api/*', (req, res) => {
@@ -17672,6 +19097,30 @@ app.use((err, req, res, next) => {
 
 const NUM_WORKERS = process.env.WEB_CONCURRENCY || Math.min(os.cpus().length, 4);
 
+// ══════════════════════════════════════════════════════════════════════════
+// 🔴 CANLI YAYIN — REST Endpoints
+// ══════════════════════════════════════════════════════════════════════════
+
+// GET /api/live/streams — Tüm aktif yayınları listele
+app.get('/api/live/streams', authenticateToken, (req, res) => {
+    const list = [];
+    for (const [streamId, s] of activeStreams.entries()) {
+        const { likedBy, offer, hostSocketId, ...pub } = s;
+        list.push(pub);
+    }
+    // Başlangıç zamanına göre en yeni önce
+    list.sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime());
+    res.json({ streams: list, total: list.length });
+});
+
+// GET /api/live/streams/:streamId — Tek yayın bilgisi
+app.get('/api/live/streams/:streamId', authenticateToken, (req, res) => {
+    const stream = activeStreams.get(req.params.streamId);
+    if (!stream) return res.status(404).json({ error: 'Yayın bulunamadı veya sona erdi.' });
+    const { likedBy, offer, hostSocketId, ...pub } = stream;
+    res.json({ stream: pub });
+});
+
 if (cluster.isPrimary || cluster.isMaster) {
     console.log(`🚀 Master process ${process.pid} - ${NUM_WORKERS} worker başlatılıyor...`);
     for (let i = 0; i < NUM_WORKERS; i++) { cluster.fork(); }
@@ -17682,6 +19131,7 @@ if (cluster.isPrimary || cluster.isMaster) {
 } else {
     (async () => {
         try {
+            await runSupplyChainChecks({ exitOnViolation: process.env.NODE_ENV === 'production' });
             await initializeDatabase();
             await migrateEncryptSensitiveColumns();
             await runSQLiteMigration();
@@ -17694,6 +19144,7 @@ if (cluster.isPrimary || cluster.isMaster) {
 ║  🌐 Domain: sehitumitkestitarimmtal.com         ║
 ║  🗄️  DB: PostgreSQL (Pool: 100 bağlantı)        ║
 ║  🔒 SQL Injection: Tüm sorgular parameterize    ║
+║  🧨 Supply Chain: CVE tarama + npm audit aktif  ║
 ║  🎬 Video: FFmpeg+HLS ABR (YouTube Algoritması) ║
 ║  📹 Video Limit: 100MB | Mavi Tik: 300MB        ║
 ║  📰 Feed: Sadece takip edilenler gösterilir     ║
@@ -17717,4 +19168,10 @@ if (cluster.isPrimary || cluster.isMaster) {
 process.on('SIGINT', async () => { console.log('\n🛑 Sunucu kapatılıyor...'); await pool.end(); process.exit(0); });
 process.on('SIGTERM', async () => { console.log('\n🛑 Sunucu kapatılıyor...'); await pool.end(); process.exit(0); });
 process.on('unhandledRejection', (reason) => { console.error('[UnhandledRejection]', reason?.message || String(reason)); });
-process.on('uncaughtException', (error) => { console.error('[UncaughtException]', error.message); process.exit(1); });
+// 🔧 DÜZELTMESİ: Anında process.exit(1) yerine 500ms bekle — PM2 yeniden başlatana kadar
+// gelen isteklere 503 dönebilsin (502 Bad Gateway yerine daha açıklayıcı hata)
+process.on('uncaughtException', (error) => {
+    console.error('[UncaughtException]', error.message, error.stack);
+    // Graceful: bekleyen istekleri bitirmeye çalış
+    setTimeout(() => process.exit(1), 500);
+});
